@@ -150,11 +150,14 @@ const analysisError = ref('')
 // 学生视角：后端只返回本人，这里取第一条即为「我」
 const me = computed(() => (isStudent ? list.value[0] || null : null))
 
-// 标题里的班级范围。管理员没选班级时代表全校合计，要说清楚是「全部班级」，
-// 不能像以前那样拿名单里第一个学生的班级当标题（那是错的）。
+// 标题里的班级范围。
+// 首选后端返回的 scope.label —— 它由服务端按同一个范围判定产生，是权威来源：
+// 教师未设班级时后端会如实回「全部班级」，而数据也确实是不筛选的，
+// 这样标题与图里的数据永远说的是同一件事（以前拿名单里第一个学生的班级当标题，
+// 教师未分班时会显示成某个学生的班级，与实际口径不符）。
 const scopeLabel = computed(() => {
   if (isAdmin) return classFilter.value || '全部班级'
-  return classrooms.value[0] || list.value[0]?.className || '—'
+  return analysis.value?.scope?.label || classrooms.value[0] || list.value[0]?.className || '—'
 })
 
 // 把最近一次考试的科目分数摊平，便于逐科展示
