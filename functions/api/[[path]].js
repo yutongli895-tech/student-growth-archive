@@ -1229,9 +1229,12 @@ async function handleAIReport(request, env, user) {
   }
 
   if (!upstream.ok) {
-    // 限流要说人话：这是「等一会儿再来」，不是「系统坏了」
+    // 限流要说人话：这是「等一会儿再来」，不是「系统坏了」。
+    // 同时把上游自己的原文带出来 —— 免费额度有「并发限流」与「额度耗尽」两种，
+    // 前者等一会就好，后者只能去账单/套餐里解决，光看 429 分不清是哪一种。
     if (upstream.status === 429) {
-      return giveUp(429, 'AI 服务当前请求过多（免费额度限流），请等 30 秒左右再试')
+      const why = upstream.hint ? `（上游：${upstream.hint}）` : ''
+      return giveUp(429, 'AI 服务当前请求过多或额度已用尽，请稍后重试' + why)
     }
     if (upstream.status === 401 || upstream.status === 403) {
       return giveUp(502, 'AI 服务鉴权失败，请检查 AGNES_API_KEY 配置')
