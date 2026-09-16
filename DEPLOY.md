@@ -301,3 +301,47 @@ dbGetStudents 原本是「先查学生，再对每个学生各查一条成绩、
    （`全部班级` → `鍏ㄩ儴鐝骇`），看起来像数据坏了，其实只是显示问题。
    要么把 stdout 当 Buffer 收（Node 里做），要么在 SQL 里用 `hex(列名)` 取值、
    用 `char(0x5168,0x90E8,0x73ED,0x7EA7)` 拼中文字面量。
+
+---
+
+## 12. ⚠️ 部署分支已变更（2026-09-16 实测，与本节冲突的以本节为准）
+
+Cloudflare Pages 的「生产分支」已经从 `production` 改成了 **`main`**。
+要看部署列表的 **Environment 列**才知道真相，不要只看分支名：
+
+```bash
+node <wrangler.js> pages deployment list --project-name student-growth-archive
+# Environment | Branch     | Source
+# Production  | main       | d89f9a2   <- 推 main 就上线
+# Preview     | production | d89f9a2   <- 推 production 只产生预览，不影响线上
+```
+
+所以现在：
+
+```bash
+git push origin main        # 只需这一行
+```
+
+`production` 分支已退化为普通分支，推它只产生 Preview。
+本文档前面「每次发布必须推两个分支」的说法在 2026-09-16 16:00 之前是对的，之后不再需要。
+
+### 只改后端时怎么验证是否上线
+
+`functions/api/[[path]].js` 的改动**不会改变静态资源指纹**（Pages Functions 与静态资源分开部署），
+所以「资源文件名与本地一致」证明不了后端已更新。改用「新接口 / 新字段」验证，例如调用
+`POST /admin/fix-classnames`，响应里应出现新加的 `mergedRoomCount` 字段。
+
+### 推送卡死时：是凭据管理器在等交互，不是网络
+
+现象：`git push` 长时间无输出挂住，但 `git ls-remote` 秒回。
+（fetch 只需匿名 GET，push 要鉴权的 `git-receive-pack`，这个不对称就是线索。）
+`GIT_TRACE=1 GIT_CURL_VERBOSE=1` 里能看到 401 之后调用 `git credential-manager get`，
+无界面环境下它会永远等下去；`GIT_TERMINAL_PROMPT=0` 拦不住它。绕过办法：
+
+```bash
+git -c credential.helper= -c credential.helper=store push origin main
+```
+
+（第一个空值清空 helper 列表，第二个只留 `store`，凭据取自 `~/.git-credentials`。）
+另注：push 成功后**输出可能是空的**，不要据此判断失败，一律用
+`git ls-remote origin refs/heads/main` 核对 SHA。
