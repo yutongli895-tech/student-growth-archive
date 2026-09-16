@@ -32,7 +32,7 @@
     <div v-show="tab === 'students'">
       <div class="card">
         <div class="row between">
-          <h2>学生列表</h2>
+          <h2>学生列表 <span v-if="allStudents.length" class="h2-count">共 {{ allStudents.length }} 人</span></h2>
           <div class="row">
             <select v-model="filterClass" class="select" @change="loadStudents">
               <option value="">全部班级</option>
@@ -51,8 +51,33 @@
           </div>
         </div>
 
+        <!-- 批量操作条：整组受编辑模式管辖。
+             它要解决的问题是「导入出错后没法收拾」——
+             逐条删除时每删一个都要重拉一次名单，名单一长就会把页面拖进
+             Cloudflare 的资源上限（503 + 列表空白 + 什么都点不了）。 -->
+        <div v-if="canEdit" class="bulk-bar">
+          <label class="bulk-check">
+            <input ref="selectAllBox" type="checkbox" :checked="allSelected" @change="toggleSelectAll" />
+            <span>全选当前列表</span>
+          </label>
+          <span class="spacer"></span>
+          <template v-if="selectedIds.length">
+            <span class="bulk-count">已选 <strong>{{ selectedIds.length }}</strong> 人</span>
+            <button class="btn outline sm" @click="clearSelection">取消选择</button>
+            <button class="btn danger sm" @click="showBulkDelete = true">批量删除</button>
+          </template>
+        </div>
+
         <div class="grid">
-          <div v-for="s in students" :key="s.id" class="student-card" @click="$router.push('/student/' + s.id)">
+          <div
+            v-for="s in students"
+            :key="s.id"
+            :class="['student-card', { selected: isSelected(s.id) }]"
+            @click="$router.push('/student/' + s.id)"
+          >
+            <label v-if="canEdit" class="card-select" :title="isSelected(s.id) ? '取消勾选' : '勾选后可批量删除'" @click.stop>
+              <input type="checkbox" :checked="isSelected(s.id)" @change="toggleSelect(s.id)" />
+            </label>
             <div class="avatar">{{ s.name.charAt(0) }}</div>
             <div class="meta">
               <div class="name">{{ s.name }}</div>
@@ -180,6 +205,85 @@
          外层再包一层 canEdit 做纵深防御：万一将来新增入口漏了判断，
          也不会出现「开关已关、弹窗却仍能提交」的旁路。 -->
     <template v-if="canEdit">
+    <!-- ============ 批量删除学生 模态 ============ -->
+    <!-- 破坏性操作不做成 window.confirm：那个框既列不清影响范围、也不能强调
+         「关联数据会一起删」。导入出错后要清掉几十条时，这一步必须看得清楚。 -->
+    <div v-if="showBulkDelete" class="modal-mask" @click.self="showBulkDelete = false">
+      <div class="modal">
+        <h3>确认删除 {{ selectedIds.length }} 名学生？</h3>
+        <p class="modal-warn">
+          ⚠️ 此操作不可撤销。这些学生的<strong>成绩、行为评分、作业记录、成长事件、家长关联</strong>都会一并删除。
+        </p>
+        <div class="del-list">
+          <span v-for="s in selectedStudents.slice(0, 15)" :key="s.id" class="del-chip">{{ s.name }}</span>
+          <span v-if="selectedStudents.length > 15" class="del-chip more">…等共 {{ selectedStudents.length }} 人</span>
+        </div>
+        <p class="modal-hint">
+          如果这些学生只是班级填错了，请改用「编辑」把班级改到正确值，这样成绩和作业记录都能保住。
+        </p>
+        <div class="modal-actions">
+          <button class="btn outline" @click="showBulkDelete = false">取消</button>
+          <button class="btn danger" :disabled="bulkDeleting" @click="doBulkDelete">
+            {{ bulkDeleting ? '删除中…' : `确认删除 ${selectedIds.length} 人` }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ 批量导入预览 模态 ============ -->
+    <!-- 导入是唯一能一次性造出大量数据的入口，所以提交前必须先看清「会变成什么」。
+         以前是解析完直接写库，文件格式不对就留下几十条脏数据，
+         只能靠人一条条删 —— 这次线上事故就是这么来的。 -->
+    <div v-if="showImportPreview" class="modal-mask" @click.self="closeImport">
+      <div class="modal modal-wide">
+        <h3>批量导入预览</h3>
+        <div class="imp-file">
+          {{ importFileName }} · 共 {{ importRows.length }} 行
+        </div>
+
+        <div class="imp-stats">
+          <span class="imp-stat ok">可导入 <strong>{{ importValid.length }}</strong></span>
+          <span v-if="importSkippedCount" class="imp-stat warn">已存在（跳过）<strong>{{ importSkippedCount }}</strong></span>
+          <span v-if="importProblems.length" class="imp-stat bad">无法导入 <strong>{{ importProblems.length }}</strong></span>
+        </div>
+
+        <div v-if="!importValid.length && importProblems.length" class="imp-block">
+          整个文件没有一行可以导入。请检查表头是否为「学号,姓名,班级,初始密码」，以及班级列是否填了真实班级。
+        </div>
+
+        <div class="imp-table-wrap">
+          <table class="imp-table">
+            <thead>
+              <tr><th>行</th><th>学号</th><th>姓名</th><th>班级</th><th>结果</th></tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="r in importPreviewRows"
+                :key="r.row"
+                :class="{ bad: r.level === 'bad', skip: r.level === 'skip' }"
+              >
+                <td class="num">{{ r.row }}</td>
+                <td>{{ r.account || '—' }}</td>
+                <td>{{ r.name || '—' }}</td>
+                <td>{{ r.className || '—' }}</td>
+                <td class="imp-reason">{{ r.reason || '可导入' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-if="importPreviewRows.length < importRows.length" class="imp-more">
+            仅展示前 {{ importPreviewRows.length }} 行，其余 {{ importRows.length - importPreviewRows.length }} 行同理处理
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <button class="btn outline" @click="closeImport">取消</button>
+          <button class="btn" :disabled="!importValid.length || importLoading" @click="doImport">
+            {{ importLoading ? '导入中…' : `确认导入 ${importValid.length} 人` }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- ============ 单条添加学生 模态 ============ -->
     <div v-if="showAdd" class="modal-mask" @click.self="showAdd = false">
       <div class="modal">
@@ -250,13 +354,14 @@
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from 'vue'
+import { ref, computed, watch, watchEffect, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { getRole, getMustChangePwd, changePassword, updateTeacher, deleteTeacher } from '../api/auth.js'
+import { getRole, getUser, getMustChangePwd, changePassword, updateTeacher, deleteTeacher } from '../api/auth.js'
 import InviteManager from '../components/InviteManager.vue'
 import ParentManager from '../components/ParentManager.vue'
-import { getStudents, getClassrooms, createStudent, importStudents, importScores, getTeachers, createTeacher, updateStudent, deleteStudent } from '../api/student.js'
+import { getStudents, getClassrooms, createStudent, importStudents, importScores, getTeachers, createTeacher, updateStudent, deleteStudent, bulkDeleteStudents } from '../api/student.js'
 import { readTextFile, downloadCSV } from '../utils/csv.js'
+import { parseStudentCSV, buildImportPreview, fallbackClassOf } from '../utils/studentImport.js'
 import { useEditMode } from '../utils/editMode.js'
 
 const route = useRoute()
@@ -268,10 +373,23 @@ const tab = ref('students')
 const msg = ref('')
 const msgType = ref('ok')
 
-const students = ref([])
+const students = ref([])        // 当前筛选后展示的列表
+const allStudents = ref([])     // 未筛选的完整名单（用于导入查重与总数展示）
 const classrooms = ref([])
 const filterClass = ref('')
 const teachers = ref([])
+
+// 批量删除
+const selectedIds = ref([])
+const showBulkDelete = ref(false)
+const bulkDeleting = ref(false)
+const selectAllBox = ref(null)
+
+// 批量导入预览
+const showImportPreview = ref(false)
+const importRows = ref([])
+const importFileName = ref('')
+const importLoading = ref(false)
 
 const showAdd = ref(false)
 const showAddTeacher = ref(false)
@@ -304,8 +422,53 @@ watch(editMode, on => {
     showAddTeacher.value = false
     showEditStudent.value = false
     showEditTeacher.value = false
+    showBulkDelete.value = false
+    showImportPreview.value = false
+    // 勾选态也一并清掉：留着会让「已选 N 人」这个提示在只读态下继续显示
+    selectedIds.value = []
   }
 })
+
+// ===== 勾选与批量删除 =====
+const allSelected = computed(() =>
+  students.value.length > 0 && students.value.every(s => selectedIds.value.includes(s.id))
+)
+const selectedStudents = computed(() => students.value.filter(s => selectedIds.value.includes(s.id)))
+
+const isSelected = id => selectedIds.value.includes(id)
+
+function toggleSelect(id) {
+  selectedIds.value = isSelected(id)
+    ? selectedIds.value.filter(x => x !== id)
+    : [...selectedIds.value, id]
+}
+function toggleSelectAll() {
+  selectedIds.value = allSelected.value ? [] : students.value.map(s => s.id)
+}
+function clearSelection() { selectedIds.value = [] }
+
+// 半选态（勾了一部分）只能靠 DOM 属性表达，模板里没有对应写法
+watchEffect(() => {
+  if (selectAllBox.value) {
+    selectAllBox.value.indeterminate = selectedIds.value.length > 0 && !allSelected.value
+  }
+})
+
+// ===== 批量导入预览 =====
+// 解析与逐行校验都在 src/utils/studentImport.js 里（纯函数、可单测），
+// 这里只负责把结果接到界面上。
+const importPreview = computed(() =>
+  buildImportPreview(importRows.value, {
+    // 兜底班级 = 导入者自己的班级；「全部班级」是哨兵，等于「没有班级」
+    fallbackClass: fallbackClassOf(getUser()),
+    existingAccounts: new Set(allStudents.value.map(s => s.id))
+  })
+)
+const importValid = computed(() => importPreview.value.filter(r => r.level === 'ok'))
+const importProblems = computed(() => importPreview.value.filter(r => r.level === 'bad'))
+const importSkippedCount = computed(() => importPreview.value.filter(r => r.level === 'skip').length)
+// 预览表上限 200 行：再长的表格既看不过来也拖慢渲染，问题行另用统计数说明
+const importPreviewRows = computed(() => importPreview.value.slice(0, 200))
 
 // 成绩导入状态
 const scoreImportResult = ref(null)
@@ -316,9 +479,12 @@ function switchTab(t) { tab.value = t; if (t === 'teachers') loadTeachers() }
 
 async function loadStudents() {
   try {
-    let list = await getStudents()
-    if (filterClass.value) list = list.filter(s => s.className === filterClass.value)
-    students.value = list
+    const all = await getStudents()
+    allStudents.value = all
+    students.value = filterClass.value ? all.filter(s => s.className === filterClass.value) : all
+    // 切班级后要丢掉看不见的勾选，否则「批量删除」会删到当前列表里没有的人
+    const visible = new Set(students.value.map(s => s.id))
+    selectedIds.value = selectedIds.value.filter(id => visible.has(id))
   } catch (e) { setMsg(e.message, 'err') }
 }
 
@@ -330,7 +496,6 @@ async function loadTeachers() {
 function downloadTemplate() {
   downloadCSV('学生导入模板.csv', '学号,姓名,班级,初始密码\n2024005,张三,高三(2)班,\n2024006,李四,高三(2)班,\n')
 }
-
 function downloadScoreTemplate() {
   downloadCSV('成绩导入模板.csv', '学号,考试名称,科目,分数\n2024001,月考1,语文,85\n2024001,月考1,数学,90\n2024002,月考1,语文,88\n')
 }
@@ -400,38 +565,82 @@ async function onScoreFile(e) {
 }
 
 function parseCSV(text) {
-  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
-  const rows = []
-  for (let i = 0; i < lines.length; i++) {
-    if (i === 0 && lines[0].includes('学号')) continue // 跳过表头
-    const c = lines[i].split(',')
-    const account = (c[0] || '').trim()
-    const name = (c[1] || '').trim()
-    const className = (c[2] || '').trim()
-    const password = (c[3] || '').trim()
-    if (account && name && className) rows.push({ account, name, className, password })
-  }
-  return rows
+  // 实现在 src/utils/studentImport.js（纯函数，可单测）
+  return parseStudentCSV(text)
 }
 
 // GBK -> UTF-8 转换（处理 Excel 导出的 GBK CSV）已统一到 src/utils/csv.js
 
+// 选好文件 → 先解析 + 预览，不直接写库
 async function onFile(e) {
   const file = e.target.files[0]
   if (!file) return
-  const text = await readTextFile(file)
-  const rows = parseCSV(text)
-  if (!rows.length) { setMsg('未解析到有效数据，请检查 CSV 格式', 'err'); return }
   try {
-    const r = await importStudents(rows)
+    const text = await readTextFile(file)
+    const rows = parseCSV(text)
+    if (!rows.length) {
+      setMsg('这个文件里没有数据行。请确认第一行是表头「学号,姓名,班级,初始密码」，并先用「下载模板」对照一下格式。', 'err')
+      return
+    }
+    importRows.value = rows
+    importFileName.value = file.name
+    showImportPreview.value = true
+  } catch (err) {
+    setMsg('读取文件失败：' + err.message, 'err')
+  } finally {
+    e.target.value = ''
+  }
+}
+
+function closeImport() {
+  showImportPreview.value = false
+  importRows.value = []
+  importFileName.value = ''
+}
+
+// 预览里确认后，才真正提交
+async function doImport() {
+  const payload = importValid.value.map(r => ({
+    account: r.account,
+    name: r.name,
+    className: r.className,
+    password: r.password
+  }))
+  if (!payload.length) return
+
+  importLoading.value = true
+  try {
+    const r = await importStudents(payload)
     let m = `导入完成：新增 ${r.created} 人`
     if (r.skipped) m += `，跳过重复 ${r.skipped} 人`
     if (r.errors && r.errors.length) m += `，失败 ${r.errors.length} 行`
     setMsg(m, r.errors && r.errors.length ? 'warn' : 'ok')
     if (r.errors && r.errors.length) console.warn('导入错误:', r.errors)
-    loadStudents()
-  } catch (err) { setMsg(err.message, 'err') }
-  e.target.value = ''
+    closeImport()
+    await loadStudents()
+  } catch (err) {
+    setMsg(err.message, 'err')
+  }
+  importLoading.value = false
+}
+
+// 批量删除：一次请求清一批（逐个删会把名单一遍遍重拉，正是卡死的成因）
+async function doBulkDelete() {
+  const ids = [...selectedIds.value]
+  if (!ids.length) return
+  bulkDeleting.value = true
+  try {
+    const r = await bulkDeleteStudents(ids)
+    let m = `已删除 ${r.removed} 名学生`
+    if (r.skipped && r.skipped.length) m += `，${r.skipped.length} 条未删除（${r.skipped[0].reason}）`
+    setMsg(m, r.skipped && r.skipped.length ? 'warn' : 'ok')
+    showBulkDelete.value = false
+    clearSelection()
+    await loadStudents()
+  } catch (err) {
+    setMsg(err.message, 'err')
+  }
+  bulkDeleting.value = false
 }
 
 async function doAddStudent() {
@@ -580,4 +789,82 @@ watch(() => route.query.tab, (t) => { if (t) tab.value = t })
 .result-box.ok { background: #e8f6ef; color: var(--primary); }
 .result-box.err { background: #fbe9e9; color: var(--danger); }
 .tip-box { background: #f8f9fa; border-radius: 8px; padding: 12px 16px; font-size: 13px; color: var(--muted); }
+
+/* =========================================================
+   批量选择 / 批量删除
+   设计意图：导入出错后要清掉几十条数据时，「选中范围」和
+   「将失去什么」必须一眼看清 —— 这类操作没有撤销。
+   ========================================================= */
+.h2-count { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+
+.bulk-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: var(--bg); border: 1px dashed var(--line);
+  border-radius: 8px; padding: 8px 12px; margin: 4px 0 14px;
+}
+.bulk-check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted); cursor: pointer; }
+.bulk-check input { width: 15px; height: 15px; accent-color: var(--primary); cursor: pointer; }
+.bulk-count { font-size: 13px; color: var(--text); }
+.bulk-count strong { color: var(--danger); font-variant-numeric: tabular-nums; }
+
+.card-select {
+  position: absolute; top: 8px; right: 8px; z-index: 2;
+  display: flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; border-radius: 6px; cursor: pointer;
+}
+.card-select input { width: 16px; height: 16px; accent-color: var(--primary); cursor: pointer; }
+/* 选中的卡片给出明确边框，避免「以为没选中」而误删 */
+.student-card { position: relative; }
+.student-card.selected {
+  outline: 2px solid var(--primary); outline-offset: -2px;
+  border-color: var(--primary); background: var(--primary-light);
+}
+
+/* =========================================================
+   破坏性操作确认
+   ========================================================= */
+.modal-warn {
+  background: var(--danger-light); color: var(--danger); border-radius: 8px;
+  padding: 10px 14px; font-size: 13.5px; line-height: 1.65; margin-bottom: 14px;
+}
+.modal-hint { font-size: 12.5px; color: var(--muted); line-height: 1.6; margin: 12px 0 4px; }
+.del-list { display: flex; flex-wrap: wrap; gap: 6px; max-height: 132px; overflow-y: auto; }
+.del-chip {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 99px;
+  padding: 3px 10px; font-size: 12.5px; color: var(--text);
+}
+.del-chip.more { color: var(--muted); border-style: dashed; }
+
+/* =========================================================
+   导入预览
+   导入是唯一能一次造出大量数据的入口，所以先看清楚再落库。
+   ========================================================= */
+.modal-wide { width: 620px; max-height: 84vh; overflow-y: auto; }
+.imp-file { font-size: 13px; color: var(--muted); margin-bottom: 12px; word-break: break-all; }
+.imp-stats { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.imp-stat {
+  border-radius: 99px; padding: 4px 12px; font-size: 12.5px; font-weight: 500;
+  background: var(--bg); color: var(--muted);
+}
+.imp-stat strong { font-variant-numeric: tabular-nums; margin-left: 2px; }
+.imp-stat.ok { background: #e8f6ef; color: var(--primary); }
+.imp-stat.warn { background: var(--warn-light); color: var(--warn); }
+.imp-stat.bad { background: var(--danger-light); color: var(--danger); }
+.imp-block {
+  background: var(--danger-light); color: var(--danger); border-radius: 8px;
+  padding: 10px 14px; font-size: 13px; line-height: 1.65; margin-bottom: 12px;
+}
+.imp-table-wrap { border: 1px solid var(--line); border-radius: 8px; max-height: 320px; overflow: auto; }
+.imp-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.imp-table th {
+  position: sticky; top: 0; background: #f7f9fb; color: var(--muted);
+  font-weight: 600; text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line);
+}
+.imp-table td { padding: 7px 10px; border-bottom: 1px solid #f2f4f7; color: var(--text); }
+.imp-table td.num { color: var(--muted); font-variant-numeric: tabular-nums; }
+.imp-table tr.bad td { background: #fdf6f6; }
+.imp-table tr.bad .imp-reason { color: var(--danger); }
+.imp-table tr.skip td { background: #fdfaf3; }
+.imp-table tr.skip .imp-reason { color: var(--warn); }
+.imp-more { padding: 8px 10px; font-size: 12.5px; color: var(--muted); background: #fafbfc; }
 </style>

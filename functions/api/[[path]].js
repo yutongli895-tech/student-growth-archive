@@ -25,6 +25,43 @@ function normalizeClassName(name) {
     .trim()
 }
 
+// ===== 班级名合法性 =====
+// 「全部班级」是界面上的筛选哨兵（语义等于「不筛选」），不是真实班级名。
+// 它曾经被真正写进学生记录：管理员账号 A001 的 class_name 恰好是它，
+// 而批量导入当时写死 className = teacher.className，于是 48 名学生全被
+// 打成「全部班级」。后果是这批学生既筛不出来、又会污染所有按班级过滤的视图
+// （dbGetStudents 里「全部班级」等于不带条件，一选就返回全校）。
+// 因此：任何写入口都必须拒绝哨兵值与空值。
+const CLASS_FILTER_ALL = '全部班级'
+function isRealClassName(v) {
+  const s = normalizeClassName(v || '')
+  return !!s && s !== CLASS_FILTER_ALL
+}
+
+// D1 单条 SQL 的绑定参数上限是 100（超过报 too many SQL variables）。
+// 所有 IN (...) 批量查询/删除都必须分片，否则「数据一多就整体报错」，
+// 这和 N+1 是同一类病：小数据量下一切正常，数据一涨就崩。
+const D1_MAX_PARAMS = 90
+function chunksOf(arr, size = D1_MAX_PARAMS) {
+  const out = []
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
+  return out
+}
+
+// 班级名是否像是「编码损坏的垃圾」（现网 classrooms 表里混进了 GBK↔UTF-8 误码：
+// 例如 U+FFFD 替换字符、CJK 私用区的半截字节）。这类名字没有任何学校会用，
+// 展示出来只会让下拉框变成乱码墙。
+function isCorruptClassName(v) {
+  const s = String(v ?? '')
+  if (!s) return true
+  // U+FFFD（替换字符）说明解码时就已经丢了信息，无法还原
+  if (s.includes('\uFFFD')) return true
+  // 全是非 ASCII 可打印的杂符（控制字符/私用区）
+  if (/[\uE000-\uF8FF]/.test(s)) return true
+  if (/[\u0000-\u001F\u007F]/.test(s)) return true
+  return false
+}
+
 async function sha256(text) {
   const buf = new TextEncoder().encode(text)
   const hash = await crypto.subtle.digest('SHA-256', buf)
@@ -104,44 +141,75 @@ async function dbGetStudents(env, className, onlyId) {
   if (onlyId) {
     query += ` AND u.id = ?`
     params.push(onlyId)
-  } else if (className && className !== '全部班级') {
+  } else if (className && className !== CLASS_FILTER_ALL) {
     query += ` AND u.class_name = ?`
     params.push(className)
   }
   query += ` ORDER BY u.id`
   const { results } = await env.DB.prepare(query).bind(...params).all()
+  const rows = results || []
+  if (!rows.length) return []
 
-  const students = []
-  for (const s of results) {
-    const lastExam = await env.DB.prepare(
-      `SELECT exam_name, subject, score, images FROM scores WHERE student_id = ? ORDER BY id DESC LIMIT 3`
-    ).bind(s.id).all()
+  const ids = rows.map(r => r.id)
 
+  // ⚠️ 这里以前是项目里最严重的性能陷阱（也是「请求失败: 503」的根因）：
+  // 每个学生各查一次成绩、一次作业汇总 → 单次请求 1 + 2N 条串行 SQL。
+  // 81 名学生 = 163 条 SQL，单请求要 2.3 秒；并发 25 个请求时单请求涨到 14 秒，
+  // 直接撞上 Cloudflare 免费版的 CPU 上限，边缘返回
+  //   「Worker exceeded resource limits」503
+  // —— 页面上就表现为「学生列表整个空了，什么都点不了」。
+  // 现在改成「按 id 分片的一次性查询」：SQL 条数与学生数无关（恒定 1 + 2×分片数）。
+  // 对照写法见 handleListHomeworkAssignments（它早就是批量查询）。
+
+  // ① 作业提交率：原本每人一条 SELECT ... WHERE student_id = ?
+  const rateById = new Map()
+  try {
+    for (const chunk of chunksOf(ids)) {
+      const { results: hw } = await env.DB.prepare(
+        `SELECT student_id, rate FROM homework WHERE student_id IN (${placeholders(chunk.length)})`
+      ).bind(...chunk).all()
+      for (const r of hw || []) rateById.set(r.student_id, r.rate)
+    }
+  } catch {
     // 汇总表尚未建立（全新部署、尚未录入过作业数据）时静默降级为 0，
-    // 不能让「一个功能没数据」升级成「班级概览整页 500」。
-    let homework = null
-    try {
-      homework = await env.DB.prepare(
-        `SELECT total, missed, rate FROM homework WHERE student_id = ?`
-      ).bind(s.id).first()
-    } catch { homework = null }
+    // 不能让「一个功能没数据」升级成「班级概览整页报错」。
+  }
 
+  // ② 最近一次考试：原本每人一条 SELECT ... ORDER BY id DESC LIMIT 3
+  //    用窗口函数一次取回「每个人的最新 3 行」；rn 升序 == 原 ORDER BY id DESC 的顺序，
+  //    这样 examMap 的建键次序与「取最后一个考试」的语义跟改前完全一致（刻意不改行为）。
+  const scoreRowsById = new Map()
+  for (const chunk of chunksOf(ids)) {
+    const { results: sc } = await env.DB.prepare(
+      `SELECT student_id, exam_name, subject, score FROM (
+         SELECT student_id, exam_name, subject, score,
+                ROW_NUMBER() OVER (PARTITION BY student_id ORDER BY id DESC) AS rn
+         FROM scores
+         WHERE student_id IN (${placeholders(chunk.length)})
+       )
+       WHERE rn <= 3
+       ORDER BY student_id, rn`
+    ).bind(...chunk).all()
+    for (const r of sc || []) {
+      if (!scoreRowsById.has(r.student_id)) scoreRowsById.set(r.student_id, [])
+      scoreRowsById.get(r.student_id).push(r)
+    }
+  }
+
+  return rows.map(s => {
     const examMap = {}
-    for (const r of lastExam.results || []) {
+    for (const r of scoreRowsById.get(s.id) || []) {
       if (!examMap[r.exam_name]) examMap[r.exam_name] = { exam: r.exam_name }
       examMap[r.exam_name][r.subject] = r.score
     }
-    const lastExamObj = Object.values(examMap).pop() || {}
-
-    students.push({
+    return {
       id: s.id,
       name: s.name,
       className: s.class_name,
-      lastExam: lastExamObj,
-      homeworkRate: homework ? homework.rate : 0
-    })
-  }
-  return students
+      lastExam: Object.values(examMap).pop() || {},
+      homeworkRate: rateById.has(s.id) ? rateById.get(s.id) : 0
+    }
+  })
 }
 
 async function dbGetStudent(env, id) {
@@ -240,6 +308,9 @@ async function handleUpdateStudent(request, env, actor, id) {
   if (!exists) return jsonResp({ error: '学生不存在' }, 404)
 
   const normalizedClass = normalizeClassName(className)
+  if (!isRealClassName(normalizedClass)) {
+    return jsonResp({ error: `班级名不能是「${CLASS_FILTER_ALL}」（那是筛选用的保留名），请填写真实班级` }, 400)
+  }
   await env.DB.prepare(`UPDATE users SET name = ?, class_name = ?, updated_at = datetime('now') WHERE id = ?`)
     .bind(name, normalizedClass, id).run()
 
@@ -253,17 +324,100 @@ async function handleUpdateStudent(request, env, actor, id) {
 }
 
 // 删除学生（教师/管理员，级联删除关联数据）
+
+// 学生名下的关联数据分布在 7 张表里。原实现只清了 6 张 —— 漏了 homework_records
+// （作业明细），被删学生的明细记录会变成孤儿行：它会继续被统计口径扫到，
+// 让「应交次数」凭空多出几个人头。
+const STUDENT_CHILD_TABLES = [
+  'scores', 'behavior', 'homework', 'events', 'ai_reports', 'parent_links', 'homework_records'
+]
+
+// 级联清除一批学生（供单删与批量删共用）。
+// 走 D1 的 batch：一组 DELETE 在同一个事务里执行，只占一次往返。
+// 逐条 await 的话「删 48 个学生」= 7×48 = 336 次串行往返，同样会撞上
+// Cloudflare 的资源上限（和列表 N+1 是同一个病）。
+async function purgeStudents(env, ids) {
+  if (!ids.length) return
+
+  // batch 是「一条失败整批回滚」，所以先探明哪些子表真实存在
+  // （全新部署可能还没有 homework_records）。探明结果对整批 id 复用。
+  let present = STUDENT_CHILD_TABLES
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders(STUDENT_CHILD_TABLES.length)})`
+    ).bind(...STUDENT_CHILD_TABLES).all()
+    present = (results || []).map(r => r.name)
+  } catch { /* 探测失败就按全表尝试 */ }
+
+  for (const chunk of chunksOf(ids, 50)) {
+    const ph = placeholders(chunk.length)
+    const stmts = present.map(t =>
+      env.DB.prepare(`DELETE FROM ${t} WHERE student_id IN (${ph})`).bind(...chunk)
+    )
+    stmts.push(env.DB.prepare(`DELETE FROM users WHERE id IN (${ph}) AND role = 'student'`).bind(...chunk))
+    await env.DB.batch(stmts)
+  }
+}
+
 async function handleDeleteStudent(request, env, actor, id) {
-  const exists = await env.DB.prepare(`SELECT id FROM users WHERE id = ? AND role = 'student'`).bind(id).first()
+  const exists = await env.DB.prepare(`SELECT id, name, class_name FROM users WHERE id = ? AND role = 'student'`).bind(id).first()
   if (!exists) return jsonResp({ error: '学生不存在' }, 404)
-  await env.DB.prepare(`DELETE FROM scores WHERE student_id = ?`).bind(id).run()
-  await env.DB.prepare(`DELETE FROM behavior WHERE student_id = ?`).bind(id).run()
-  await env.DB.prepare(`DELETE FROM homework WHERE student_id = ?`).bind(id).run()
-  await env.DB.prepare(`DELETE FROM events WHERE student_id = ?`).bind(id).run()
-  await env.DB.prepare(`DELETE FROM ai_reports WHERE student_id = ?`).bind(id).run()
-  await env.DB.prepare(`DELETE FROM parent_links WHERE student_id = ?`).bind(id).run()
-  await env.DB.prepare(`DELETE FROM users WHERE id = ?`).bind(id).run()
+  if (teacherOutOfScope(actor, exists.class_name)) {
+    return jsonResp({ error: '该学生不在你负责的班级' }, 403)
+  }
+  await purgeStudents(env, [exists.id])
   return jsonResp({ success: true })
+}
+
+// 批量删除学生。
+// 为什么必须有：逐条删除时每删一个都要重新拉一次学生列表，而列表一旦变慢
+// （见 dbGetStudents 的 N+1 注释），删到一半就会整页 503 卡死，形成
+// 「越删越动不了」的死循环 —— 这正是批量导入出错后无法收拾的原因。
+async function handleBulkDeleteStudents(request, env, actor) {
+  let body
+  try { body = await request.json() } catch { return jsonResp({ error: '请求体无效' }, 400) }
+
+  const raw = Array.isArray(body.ids) ? body.ids : []
+  const ids = [...new Set(raw.map(v => String(v ?? '').trim()).filter(Boolean))]
+  if (!ids.length) return jsonResp({ error: '请先勾选要删除的学生' }, 400)
+  if (ids.length > 500) return jsonResp({ error: '单次最多删除 500 名学生' }, 400)
+
+  const removed = []
+  const skipped = []
+  const removedIds = new Set()
+
+  for (const chunk of chunksOf(ids, 50)) {
+    const { results } = await env.DB.prepare(
+      `SELECT id, name, class_name FROM users WHERE role = 'student' AND id IN (${placeholders(chunk.length)})`
+    ).bind(...chunk).all()
+
+    const allowed = []
+    for (const r of (results || [])) {
+      if (teacherOutOfScope(actor, r.class_name)) {
+        skipped.push({ id: r.id, name: r.name, reason: '不在你负责的班级' })
+      } else {
+        allowed.push(r)
+      }
+    }
+    if (!allowed.length) continue
+
+    await purgeStudents(env, allowed.map(r => r.id))
+    for (const r of allowed) { removed.push({ id: r.id, name: r.name }); removedIds.add(r.id) }
+  }
+
+  // 如实回报没删掉的：可能已被别处删除，或不在权限范围内
+  for (const id of ids) {
+    if (!removedIds.has(id) && !skipped.some(s => s.id === id)) {
+      skipped.push({ id, reason: '学生不存在' })
+    }
+  }
+
+  return jsonResp({
+    success: true,
+    removed: removed.length,
+    removedStudents: removed,
+    skipped
+  })
 }
 
 // 编辑教师（管理员）
@@ -563,6 +717,14 @@ async function handleCreateStudent(request, env, teacher) {
     return jsonResp({ error: '学号、姓名、班级均为必填' }, 400)
   }
   const normalizedClass = normalizeClassName(className)
+  // 「全部班级」只是筛选哨兵，不是真实班级；允许它落库就会产生
+  // 既筛不出来、又污染所有班级视图的学生（线上已经出现过 48 条）
+  if (!isRealClassName(normalizedClass)) {
+    return jsonResp({ error: `班级名不能是「${CLASS_FILTER_ALL}」（那是筛选用的保留名），请填写真实班级` }, 400)
+  }
+  if (isCorruptClassName(normalizedClass)) {
+    return jsonResp({ error: '班级名包含无法识别的字符，请重新输入或粘贴' }, 400)
+  }
   const exists = await env.DB.prepare(`SELECT id FROM users WHERE account = ?`).bind(account).first()
   if (exists) return jsonResp({ error: '该学号已存在' }, 409)
 
@@ -585,83 +747,190 @@ async function handleCreateStudent(request, env, teacher) {
 
 async function handleFixClassNames(request, env) {
   try {
-    const { results: users } = await env.DB.prepare(`SELECT id, class_name FROM users`).all()
+    const { results: users } = await env.DB.prepare(`SELECT id, role, class_name FROM users`).all()
     const fwRe = /[\uFF08\uFF09]/
     const fixedUsers = []
+    const dirtyUsers = []
     for (const u of users) {
+      // 哨兵 / 编码损坏的班级名：无法自动推断正确班级，只如实上报，由管理员决定删除或改班。
+      // 只统计学生：教师/家长本来就可能没有班级，不该混进「待清理」里徒增噪音。
+      if (u.role === 'student' && (!u.class_name || !isRealClassName(u.class_name) || isCorruptClassName(u.class_name))) {
+        dirtyUsers.push({ id: u.id, class_name: u.class_name })
+        continue
+      }
       if (fwRe.test(u.class_name)) {
         const n = normalizeClassName(u.class_name)
         await env.DB.prepare(`UPDATE users SET class_name = ? WHERE id = ?`).bind(n, u.id).run()
         fixedUsers.push({ id: u.id, from: u.class_name, to: n })
       }
     }
+
     const { results: rooms } = await env.DB.prepare(`SELECT id, name FROM classrooms`).all()
     const fixedRooms = []
+    const removedRooms = []
     for (const r of rooms) {
+      // 班级表里的哨兵与乱码行直接删掉：它们不是班级，留着只会让下拉框变成乱码墙
+      if (!isRealClassName(r.name) || isCorruptClassName(r.name)) {
+        await env.DB.prepare(`DELETE FROM classrooms WHERE id = ?`).bind(r.id).run()
+        removedRooms.push({ id: r.id, name: r.name })
+        continue
+      }
       if (fwRe.test(r.name)) {
         const n = normalizeClassName(r.name)
         await env.DB.prepare(`UPDATE classrooms SET name = ? WHERE id = ?`).bind(n, r.id).run()
         fixedRooms.push({ id: r.id, from: r.name, to: n })
       }
     }
-    return jsonResp({ success: true, fixedUsers, fixedRooms,
-      fixedUserCount: fixedUsers.length, fixedRoomCount: fixedRooms.length })
+
+    return jsonResp({
+      success: true,
+      fixedUsers, fixedRooms,
+      removedRooms,
+      dirtyUsers,
+      fixedUserCount: fixedUsers.length,
+      fixedRoomCount: fixedRooms.length,
+      removedRoomCount: removedRooms.length,
+      dirtyUserCount: dirtyUsers.length
+    })
   } catch (e) {
     return jsonResp({ error: 'fix failed: ' + e.message }, 500)
   }
 }
 
 async function handleImportStudents(request, env, teacher) {
-  const { students } = await request.json()
-  if (!Array.isArray(students) || students.length === 0) {
+  let body
+  try { body = await request.json() } catch { return jsonResp({ error: '请求体无效' }, 400) }
+  const list = Array.isArray(body.students) ? body.students : null
+  if (!list || list.length === 0) {
     return jsonResp({ error: '没有可导入的学生数据' }, 400)
   }
+  if (list.length > 2000) {
+    return jsonResp({ error: `单次最多导入 2000 行（本次 ${list.length} 行），请把文件拆开分次导入` }, 400)
+  }
 
-  let created = 0, skipped = 0
+  const fallbackClass = isRealClassName(teacher.className) ? normalizeClassName(teacher.className) : ''
+
+  // ---------- 第一步：全量校验，一行都不写 ----------
+  // 原实现是「边校验边写」，所以文件格式不对时会把一半脏数据写进库，
+  // 事后只能靠人肉一条条删 —— 这正是本次线上事故的成因。
+  // 现在校验不通过的行直接不写，并逐行回报原因，做到「要么全对，要么不动库」。
+  const prepared = []
   const errors = []
-  const fwRe = /[\uFF08\uFF09]/
+  const seen = new Set()
 
-  for (let i = 0; i < students.length; i++) {
-    const row = students[i]
-    const account = String(row.account || '').trim()
-    const name = String(row.name || '').trim()
-    // className ignored - forced to teacher.className
-    // 导入时额外清理全角括号
-    const className = teacher.className
-    if (!account || !name || !className) {
-      errors.push({ row: i + 1, account, reason: '学号/姓名/班级 任一为空' })
+  for (let i = 0; i < list.length; i++) {
+    const row = list[i] || {}
+    const account = String(row.account ?? '').trim()
+    const name = String(row.name ?? '').trim()
+
+    // 班级优先取 CSV 里那一列；行内没填才回落到导入者自己的班级。
+    // 关键修复：以前是 `className ignored - forced to teacher.className`，
+    // 于是用管理员账号导入时，管理员的哨兵班级「全部班级」被复制到了
+    // 每一条学生记录上，产生了 48 条既筛不出、又污染所有班级视图的脏数据。
+    const rawClass = String(row.className ?? '').trim()
+    const className = rawClass ? normalizeClassName(rawClass) : fallbackClass
+
+    if (!account || !name) {
+      errors.push({ row: i + 1, account, reason: '学号或姓名为空' })
       continue
     }
-    const exists = await env.DB.prepare(`SELECT id FROM users WHERE account = ?`).bind(account).first()
-    if (exists) { skipped++; continue }
+    if (!isRealClassName(className)) {
+      errors.push({
+        row: i + 1, account,
+        reason: rawClass
+          ? `班级名「${className}」不是有效班级（不能是「${CLASS_FILTER_ALL}」，那是筛选用的保留名）`
+          : '缺少班级：CSV 里没填班级列，而你的账号也没有绑定班级'
+      })
+      continue
+    }
+    if (seen.has(account)) {
+      errors.push({ row: i + 1, account, reason: '同一个文件里学号重复' })
+      continue
+    }
+    seen.add(account)
+    prepared.push({ row: i + 1, account, name, className, password: String(row.password ?? '').trim() })
+  }
 
-    const pwd = (row.password && String(row.password).length >= 1) ? String(row.password) : account
-    const hash = await sha256(pwd)
+  // ---------- 第二步：一次查出已存在的学号（原本每人一条 SELECT）----------
+  const existing = new Set()
+  const allAccounts = [...seen]
+  for (const chunk of chunksOf(allAccounts)) {
+    const { results } = await env.DB.prepare(
+      `SELECT account FROM users WHERE account IN (${placeholders(chunk.length)})`
+    ).bind(...chunk).all()
+    for (const r of (results || [])) existing.add(r.account)
+  }
+
+  const toCreate = prepared.filter(p => !existing.has(p.account))
+  const skipped = prepared.length - toCreate.length
+
+  // ---------- 第三步：多行 VALUES 批量插入（原本每人两条 INSERT）----------
+  // 每行 6 个绑定参数，按 90 上限分片 → 每批 15 行。
+  const hashed = []
+  const classNames = new Set()
+  for (const p of toCreate) {
+    const pwd = (p.password && p.password.length >= 1) ? p.password : p.account
+    hashed.push({ ...p, hash: await sha256(pwd) })
+    classNames.add(p.className)
+  }
+
+  let created = 0
+  for (const chunk of chunksOf(hashed, 15)) {
+    const values = chunk.map(() => `(?, ?, ?, 'student', ?, ?, 'active', 1, ?)`).join(', ')
+    const binds = []
+    for (const r of chunk) binds.push(r.account, r.account, r.hash, r.name, r.className, teacher.id)
     try {
-      await env.DB.prepare(
-        `INSERT INTO users (id, account, password_hash, role, name, class_name, status, must_change_pwd, created_by)
-         VALUES (?, ?, ?, 'student', ?, ?, 'active', 1, ?)`
-      ).bind(account, account, hash, name, className, teacher.id).run()
-      await env.DB.prepare(
-        `INSERT OR IGNORE INTO classrooms (id, name, owner_id) VALUES (?, ?, ?)`
-      ).bind('C_' + className, className, teacher.id).run()
-      created++
+      const res = await env.DB.prepare(
+        `INSERT OR IGNORE INTO users (id, account, password_hash, role, name, class_name, status, must_change_pwd, created_by)
+         VALUES ${values}`
+      ).bind(...binds).run()
+      // 以数据库实际写入行数为准（OR IGNORE 会跳过并发冲突的行）
+      const changed = Number(res?.meta?.changes)
+      created += Number.isFinite(changed) ? changed : chunk.length
     } catch (e) {
-      errors.push({ row: i + 1, account, reason: '写入失败: ' + e.message })
+      for (const r of chunk) {
+        errors.push({ row: r.row, account: r.account, reason: '写入失败: ' + e.message })
+      }
     }
   }
-  return jsonResp({ success: true, created, skipped, errors, total: students.length })
+
+  // 班级表补登记：原本每人一条，现在每个班级一条
+  for (const cn of classNames) {
+    try {
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO classrooms (id, name, owner_id) VALUES (?, ?, ?)`
+      ).bind('C_' + cn, cn, teacher.id).run()
+    } catch { /* 班级表可能不存在，不影响学生导入 */ }
+  }
+
+  return jsonResp({ success: true, created, skipped, errors, total: list.length })
 }
 
 async function handleListClassrooms(request, env, user) {
   if (user.role === 'admin') {
-    const { results } = await env.DB.prepare(`SELECT name FROM classrooms ORDER BY name`).all()
-    return jsonResp(results.map(r => r.name))
+    // 管理员看到的是「班级表 ∪ 学生实际所在班级」。
+    // 只读 classrooms 表不够：历史上批量导入的学生不会登记到该表，
+    // 于是真实存在的班反而在下拉框里选不到。
+    const names = new Set()
+    const { results: rooms } = await env.DB.prepare(`SELECT name FROM classrooms`).all()
+    for (const r of (rooms || [])) names.add(r.name)
+    const { results: used } = await env.DB.prepare(
+      `SELECT DISTINCT class_name FROM users WHERE role = 'student' AND class_name IS NOT NULL`
+    ).all()
+    for (const r of (used || [])) names.add(r.class_name)
+
+    // 过滤掉筛选哨兵与编码损坏的垃圾名（现网 classrooms 里混进了 GBK↔UTF-8 误码），
+    // 否则下拉框会变成一片乱码，选谁都对不上。
+    return jsonResp(
+      [...names]
+        .filter(n => isRealClassName(n) && !isCorruptClassName(n))
+        .sort((a, b) => String(a).localeCompare(String(b), 'zh'))
+    )
   }
   const { results } = await env.DB.prepare(
     `SELECT DISTINCT class_name FROM users WHERE role='student' AND class_name = ?`
   ).bind(user.className).all()
-  return jsonResp(results.map(r => r.class_name).filter(Boolean))
+  return jsonResp(results.map(r => r.class_name).filter(n => isRealClassName(n)))
 }
 
 async function handleAIReport(request, env, user) {
@@ -1131,6 +1400,23 @@ async function upsertHomeworkSummary(env, studentId, total, missed) {
   return saved.rate
 }
 
+// homework 表能不能用 ON CONFLICT(student_id) 做 upsert，完全取决于
+// 有没有 student_id 的唯一索引。现网这张表原本没有，索引由 ensureHomeworkSchema
+// 在首次写入时补上；但存量重复行会让建索引失败，所以必须探测而不是假定。
+const __hwUpsertCache = new WeakMap()
+async function homeworkSummaryCanUpsert(env) {
+  if (env.DB && __hwUpsertCache.has(env.DB)) return __hwUpsertCache.get(env.DB)
+  let ok = false
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'homework'`
+    ).all()
+    ok = (results || []).some(r => /student_id/i.test(String(r.sql || '')) && /UNIQUE/i.test(String(r.sql || '')))
+  } catch { ok = false }
+  if (env.DB) __hwUpsertCache.set(env.DB, ok)
+  return ok
+}
+
 // 教师班级范围判定：只有「双方都明确有班级且不一致」才阻断。
 // 教师未设班级 / 「全部班级」→ 不限；学生未分班 → 没有可比较的对象，不阻断
 // （否则一个还没分班的学生会让教师完全没法为他录入作业）。
@@ -1147,20 +1433,76 @@ function teacherOutOfScope(user, studentClassName) {
 // 避免明细功能一上线就把教师手工录入的提交率清零。
 async function recomputeHomeworkForStudents(env, studentIds, { allowZero = false } = {}) {
   const ids = [...new Set((studentIds || []).filter(Boolean))]
+  if (!ids.length) return 0
+
+  await ensureHomeworkSchema(env)
+  const shape = await homeworkSummaryShape(env)
+  const canUpsert = await homeworkSummaryCanUpsert(env)
+
   let updated = 0
-  for (const sid of ids) {
+
+  for (const chunk of chunksOf(ids)) {
+    // ① 一条 SQL 取回整批学生的状态计数（原本每人一条 SELECT）
     const { results } = await env.DB.prepare(
-      `SELECT status, COUNT(*) AS c FROM homework_records WHERE student_id = ? GROUP BY status`
-    ).bind(sid).all()
-    const counts = { submitted: 0, late: 0, missing: 0, exempt: 0, pending: 0 }
+      `SELECT student_id, status, COUNT(*) AS c
+       FROM homework_records
+       WHERE student_id IN (${placeholders(chunk.length)})
+       GROUP BY student_id, status`
+    ).bind(...chunk).all()
+
+    const agg = new Map()
     for (const r of (results || [])) {
-      if (counts[r.status] !== undefined) counts[r.status] = Number(r.c) || 0
+      if (!agg.has(r.student_id)) agg.set(r.student_id, { total: 0, missed: 0 })
+      const a = agg.get(r.student_id)
+      const c = Number(r.c) || 0
+      if (r.status === 'submitted' || r.status === 'late') a.total += c
+      else if (r.status === 'missing') { a.total += c; a.missed += c }
     }
-    const total = counts.submitted + counts.late + counts.missing
-    if (total === 0 && !allowZero) continue
-    await upsertHomeworkSummary(env, sid, total, counts.missing)
-    updated++
+
+    const targets = []
+    for (const sid of chunk) {
+      const a = agg.get(sid)
+      if (!a) {
+        // 该学生一条明细都没有：allowZero 时才把汇总归零，否则保留原有手工值
+        if (allowZero) targets.push([sid, 0, 0])
+        continue
+      }
+      if (a.total === 0 && !allowZero) continue
+      targets.push([sid, a.total, a.missed])
+    }
+    if (!targets.length) continue
+
+    if (canUpsert) {
+      // ② 有 student_id 唯一索引：整批写成一次 batch（一次往返），
+      //    每人的 2~3 次往返 → 总共 2 次往返。48 人从 ~96 次降到 2 次。
+      const cols = ['student_id', 'total', 'missed']
+      if (shape.hasRateColumn) cols.push('rate')
+      if (shape.hasUpdatedAt) cols.push('updated_at')
+      const marks = cols.map(c => (c === 'updated_at' ? `datetime('now')` : '?'))
+      const sets = ['total = excluded.total', 'missed = excluded.missed']
+      if (shape.hasRateColumn) sets.push('rate = excluded.rate')
+      if (shape.hasUpdatedAt) sets.push('updated_at = excluded.updated_at')
+
+      const stmts = targets.map(([sid, total, missed]) => {
+        const vals = [sid, total, missed]
+        if (shape.hasRateColumn) vals.push(total === 0 ? 0 : (total - missed) / total)
+        return env.DB.prepare(
+          `INSERT INTO homework (${cols.join(', ')}) VALUES (${marks.join(', ')})
+           ON CONFLICT(student_id) DO UPDATE SET ${sets.join(', ')}`
+        ).bind(...vals)
+      })
+      await env.DB.batch(stmts)
+      updated += targets.length
+    } else {
+      // ③ 没有唯一索引（存量重复行导致建索引失败）：
+      //    退回逐条走唯一写入入口，绝不在这里自己拼 INSERT，免得绕开生成列判定。
+      for (const [sid, total, missed] of targets) {
+        await writeHomeworkSummary(env, sid, total, missed)
+        updated++
+      }
+    }
   }
+
   return updated
 }
 
@@ -1278,11 +1620,12 @@ async function handleCreateHomeworkAssignment(request, env, teacher) {
 
   const { id: assignmentId } = await getOrCreateAssignment(env, className, subject, title, dueDate, teacher.id)
 
-  for (const s of students) {
-    await env.DB.prepare(
-      `INSERT OR IGNORE INTO homework_records (assignment_id, student_id, status) VALUES (?, ?, 'pending')`
-    ).bind(assignmentId, s.id).run()
-  }
+  // 一条 INSERT ... SELECT 给全班建「待标记」记录（原本逐个学生 INSERT，
+  // 48 人的班 = 48 次往返，是同一类会撞上 Cloudflare 资源上限的写法）
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO homework_records (assignment_id, student_id, status)
+     SELECT ?, id, 'pending' FROM users WHERE role = 'student' AND class_name = ?`
+  ).bind(assignmentId, className).run()
 
   return jsonResp({ success: true, id: assignmentId, studentCount: students.length })
 }
@@ -1599,6 +1942,13 @@ export async function onRequest(context) {
     const { user: t, response: r } = await requireTeacher(request, env)
     if (r) return r
     return handleImportStudents(request, env, t)
+  }
+
+  // 批量删除学生（导入出错后的收拾工具：一次清掉一批，不必逐条点）
+  if (path === '/students/bulk-delete' && method === 'POST') {
+    const { user: t, response: r } = await requireTeacher(request, env)
+    if (r) return r
+    return handleBulkDeleteStudents(request, env, t)
   }
 
   // 批量导入成绩

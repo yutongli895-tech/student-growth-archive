@@ -2,3 +2,6 @@ node_modules
 dist
 .DS_Store
 *.local
+
+# wrangler 的本地状态目录（诊断时执行 d1/kv 命令会自动生成）
+.wrangler

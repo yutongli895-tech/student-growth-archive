@@ -214,3 +214,90 @@ node run_all_tests.mjs               # 一次跑完全部套件并汇总
 `edit_mode_test.mjs` 里除了逻辑测试，还有一份**结构断言表**：把「受管辖的写法」
 逐个列出来（例如 `v-if="canEdit" class="btn outline sm" @click="openHomeworkEdit"`）。
 新增写入按钮却忘了挂 `canEdit` 时，对应条目会失配，测试立刻失败 —— 这是防旁路的第一道网。
+
+## 9. ⚠️ 性能铁律：单次请求的 SQL 条数必须与数据量无关
+
+线上出现过「学生列表整个空了、什么都点不了，报 请求失败: 503」。
+根因不是数据坏了，而是列表接口里有 N+1：
+
+```
+dbGetStudents 原本是「先查学生，再对每个学生各查一条成绩、一条作业汇总」
+81 名学生 = 1 + 2×81 = 163 条串行 SQL，单请求 2.3 秒；
+并发 25 个请求时单请求涨到 14 秒，直接撞上 Cloudflare 免费版的 CPU 上限，
+边缘返回 503，页面上的表现就是「列表空白 + 什么都点不了」。
+```
+
+区分办法：看 Cloudflare 返回的**响应体**。自己代码报的错一定是 JSON（含 `error` 字段）；
+平台掐断返回的是 HTML 错误页，标题长这样：
+
+```html
+<title>Worker exceeded resource limits | 你的域名 | Cloudflare</title>
+```
+
+前端 `fetchJSON` 在这种情况下拿不到 `error` 字段，于是显示成「请求失败: 503」——
+看到这句基本可以直接判定是平台层超限，不要再往业务逻辑里找。
+
+### 规矩
+
+1. **列表类接口的 SQL 条数必须是常数**，不能随行数增长。
+   按 id 批量取附属数据用 `WHERE x IN (...)` 一次查回来；
+   需要「每人取前 N 条」用窗口函数（`ROW_NUMBER() OVER (PARTITION BY ...)`）。
+2. **`IN (...)` 必须分片**：D1 单条 SQL 的绑定参数上限是 100，
+   超过直接报 `too many SQL variables`。项目里统一用 `chunksOf()`（默认 90 一片）。
+3. **批量写/删走 `env.DB.batch()`**（一组语句一个事务、只占一次往返），
+   或多行 `VALUES`。逐条 `await` 的循环在几十条数据时就开始出问题。
+   参考实现：`purgeStudents()`（删学生）、`handleImportStudents()`（导入）、
+   `recomputeHomeworkForStudents()`（回写汇总）。
+4. **新增任何写入入口都要问一句：这条路径在 500 条数据时会发多少条 SQL？**
+
+### 怎么防复发
+
+这类缺陷有个特点：**返回的数据完全正确**，所以任何「比对返回值」的测试都抓不到它。
+必须直接断言 SQL 条数 —— 测试基座（`test-harness.mjs`）的 `makeTestEnv()` 返回
+`stats`，会统计 `roundTrips`（往返次数）与 `statements`（语句条数）。
+见 `api_scale_test.mjs`：同一接口在 3 人与 60 人下测出的 SQL 条数必须相等。
+
+## 10. ⚠️ 「全部班级」是筛选保留名，不是班级
+
+`全部班级` 是下拉框里「不筛选」的哨兵值，代码里到处用它表示「查全部」。
+它**绝不能被写进 `users.class_name`**。线上出过一次：
+
+```
+用管理员账号批量导入学生
+  → 管理员自己的 class_name 恰好是「全部班级」
+  → 而当时的导入写死了 className = teacher.className
+  → 48 名学生全部被打上「全部班级」
+  → 这批学生既筛不出来（选「全部班级」等于不筛选，会返回全校），
+    又污染按班级过滤的所有视图，事后只能人肉清理。
+```
+
+现在的防线有三层：
+
+- **写入口拒绝**：`handleCreateStudent` / `handleUpdateStudent` / `handleImportStudents`
+  统一走 `isRealClassName()`，哨兵值与空值直接 400 并说明原因。
+- **导入尊重 CSV**：班级以 CSV 的班级列为准，缺失才回落到导入者的班级。
+- **界面先预览**：导入前弹预览，逐行标出「可导入 / 有问题 / 已存在」，
+  确认后才提交（`src/utils/studentImport.js` 是纯函数，有单测）。
+
+历史脏数据怎么收拾：
+
+- 少量：在「学生管理」点「编辑」把班级改对（成绩、作业记录都能保住）。
+- 成批：勾选 + 「批量删除」（一次请求清一批，不会因为逐条删而卡死）。
+- 班级下拉框里的乱码名：POST `/api/admin/fix-classnames`（管理员），
+  它会清掉 `classrooms` 里编码损坏与哨兵行，并列出班级为哨兵值的学生。
+
+## 11. wrangler 排查线上时的四个坑（都实际踩过）
+
+1. **`kv key` 系列命令默认操作本地存储**，必须显式加 `--remote`。
+   不加的话 put 会「成功」，但它写的是本地目录，线上读不到，
+   排查时表现为「会话造好了却一直 401」。
+2. **`d1 execute --file` 走的是批量导入通道**，只返回汇总
+   （`Total queries executed` / `Rows read`），**拿不到结果集**。查数据要用 `--command`。
+3. **不要用 `spawn(npx, [...], { shell: true })` 传 SQL**：
+   Windows 上参数会被拼成字符串交给 cmd.exe，SQL 里的 `*` `(` `)` `'` 被拆开，
+   `--command` 收不到值（报 `[string] [required]`）。
+   直接 spawn `node <path>/wrangler/bin/wrangler.js` 且 `shell: false`，argv 逐字传递。
+4. **PowerShell 控制台按 GBK 解码子进程输出**，结果里的中文会变成乱码
+   （`全部班级` → `鍏ㄩ儴鐝骇`），看起来像数据坏了，其实只是显示问题。
+   要么把 stdout 当 Buffer 收（Node 里做），要么在 SQL 里用 `hex(列名)` 取值、
+   用 `char(0x5168,0x90E8,0x73ED,0x7EA7)` 拼中文字面量。

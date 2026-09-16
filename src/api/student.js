@@ -140,6 +140,21 @@ export async function deleteStudent(id) {
   return { success: true }
 }
 
+// 批量删除学生（教师/管理员）。
+// 逐条删时「每删一个都要重拉一次学生列表」，名单一长就会把页面拖进
+// Cloudflare 的资源上限（表现为 503、列表空白、什么都点不了）。
+// 这里一次请求清一批，SQL 条数与学生数无关。
+export async function bulkDeleteStudents(ids) {
+  if (USE_WORKER) {
+    return fetchJSON(`${API}/students/bulk-delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids })
+    })
+  }
+  return { success: true, removed: ids.length, removedStudents: [], skipped: [] }
+}
+
 // 教师添加单条成绩
 // payload: { examName, subject, score }
 export async function addScore(studentId, payload) {
