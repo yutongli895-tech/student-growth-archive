@@ -219,13 +219,17 @@ async function dbGetStudent(env, id) {
   if (!user) return null
 
   const { results: scoreRows } = await env.DB.prepare(
-    `SELECT exam_name, subject, score, images FROM scores WHERE student_id = ? ORDER BY id`
+    `SELECT id, exam_name, subject, score, images FROM scores WHERE student_id = ? ORDER BY id`
   ).bind(id).all()
 
   const examMap = {}
   for (const r of scoreRows) {
-    if (!examMap[r.exam_name]) examMap[r.exam_name] = { exam: r.exam_name, _images: {} }
+    if (!examMap[r.exam_name]) examMap[r.exam_name] = { exam: r.exam_name, _images: {}, _ids: {} }
     examMap[r.exam_name][r.subject] = r.score
+    // 每科成绩的行主键一并带出：前端「修改/删除某一条成绩」要靠它定位。
+    // 不暴露主键的话，前端只能拿 (考试,科目,分数) 去猜，改完分数就再也找不到自己了。
+    // 下划线开头是为了跟「科目→分数」那层数据分开（学科分析、趋势图都按 _ 前缀跳过）。
+    examMap[r.exam_name]._ids[r.subject] = r.id
     try { examMap[r.exam_name]._images[r.subject] = JSON.parse(r.images || '[]') } catch { examMap[r.exam_name]._images[r.subject] = [] }
   }
   const scores = Object.values(examMap)
@@ -1166,14 +1170,149 @@ async function handleAIReport(request, env, user) {
   }
 }
 
-async function handleAddScore(request, env, studentId) {
-  const { exam_name, subject, score, images } = await request.json()
-  if (!exam_name || !subject || score === undefined) return jsonResp({ error: '缺少参数' }, 400)
-  const imagesJson = Array.isArray(images) ? JSON.stringify(images.slice(0, 3)) : '[]'
+// ===== 单条成绩：增 / 改 / 删 =====
+//
+// 三个动作共用一套前置校验，所以抽成 loadScoreTarget：
+//   学生存在 → 教师在不在自己班里 → （可选）这条成绩属于这个学生。
+// 必须走学生这一层判断 —— scores 表只有 student_id，没有 class_name，
+// 成绩行的「班级归属」只能由所属学生推出来。
+// 少了这一步，任何教师改一下 URL 里的学号就能篡改别班的成绩。
+async function loadScoreTarget(env, teacher, studentId, scoreId) {
+  const student = await env.DB.prepare(
+    `SELECT id, name, class_name FROM users WHERE id = ? AND role = 'student'`
+  ).bind(studentId).first()
+  if (!student) return { response: jsonResp({ error: '学生不存在' }, 404) }
+  if (teacherOutOfScope(teacher, student.class_name)) {
+    return { response: jsonResp({ error: '无权操作其他班级学生的成绩' }, 403) }
+  }
+  if (scoreId === undefined || scoreId === null || scoreId === '') return { student }
+
+  const row = await env.DB.prepare(
+    `SELECT id, exam_name, subject, score FROM scores WHERE id = ? AND student_id = ?`
+  ).bind(scoreId, studentId).first()
+  if (!row) return { response: jsonResp({ error: '成绩记录不存在' }, 404) }
+  return { student, row }
+}
+
+// 分数：允许小数（87.5 这种半分很常见），但必须是有穷数且不荒谬。
+// 刻意不写死「0–100」上限 —— 150 分制试卷、体育按 1000 分计分的学校都真实存在，
+// 卡死上限会把合法数据挡在门外；这里只拦明显是误输入的（负数 / 四位数 / 非数字）。
+// 前端另有一层「0–100 之外标黄提醒」，那是提示，不是拒绝。
+const SCORE_MAX = 1000
+function normalizeScore(v) {
+  const raw = typeof v === 'number' ? v : String(v ?? '').trim()
+  if (raw === '') return { error: '分数不能为空' }
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return { error: '分数必须是数字' }
+  if (n < 0) return { error: '分数不能为负数' }
+  if (n > SCORE_MAX) return { error: `分数不能超过 ${SCORE_MAX}` }
+  // 去掉浮点噪声（0.1+0.2 那一类），保留一位小数
+  return { value: Math.round(n * 10) / 10 }
+}
+
+function normalizeExamName(v) {
+  const s = String(v ?? '').trim()
+  if (!s) return { error: '考试名称不能为空' }
+  if (s.length > 40) return { error: '考试名称过长（最多 40 个字）' }
+  return { value: s }
+}
+
+function normalizeSubject(v) {
+  const s = String(v ?? '').trim()
+  if (!s) return { error: '科目不能为空' }
+  if (s.length > 20) return { error: '科目名过长（最多 20 个字）' }
+  return { value: s }
+}
+
+// scores 上有 UNIQUE(student_id, exam_name, subject)：把一条成绩改名/改科目时，
+// 很容易撞上同一次考试的同一科目。撞了就让数据库抛约束错误的话，前端只会看到 500，
+// 教师完全不知道发生了什么。所以在写入前先查出来，把冲突讲清楚。
+async function findScoreClash(env, studentId, examName, subject, excludeId) {
+  const row = await env.DB.prepare(
+    `SELECT id FROM scores WHERE student_id = ? AND exam_name = ? AND subject = ? AND id != ?`
+  ).bind(studentId, examName, subject, excludeId ?? -1).first()
+  return row || null
+}
+
+// 新增成绩（教师/管理员）
+async function handleAddScore(request, env, teacher, studentId) {
+  const loaded = await loadScoreTarget(env, teacher, studentId)
+  if (loaded.response) return loaded.response
+
+  const body = await request.json().catch(() => ({}))
+  const exam = normalizeExamName(body.exam_name)
+  if (exam.error) return jsonResp({ error: exam.error }, 400)
+  const subject = normalizeSubject(body.subject)
+  if (subject.error) return jsonResp({ error: subject.error }, 400)
+  const score = normalizeScore(body.score)
+  if (score.error) return jsonResp({ error: score.error }, 400)
+
+  const imagesJson = Array.isArray(body.images) ? JSON.stringify(body.images.slice(0, 3)) : '[]'
+
+  // 同一场考试的同一科目只保留一条（唯一约束 + INSERT OR REPLACE = 覆盖更新）。
+  // 这个「重复录入即改正」的行为要如实回报，否则教师以为自己又加了一条，
+  // 回头看到科目数没变会以为系统没保存。
+  const existing = await findScoreClash(env, studentId, exam.value, subject.value, null)
+
   await env.DB.prepare(
     `INSERT OR REPLACE INTO scores (student_id, exam_name, subject, score, images) VALUES (?, ?, ?, ?, ?)`
-  ).bind(studentId, exam_name, subject, score, imagesJson).run()
-  return jsonResp({ success: true })
+  ).bind(studentId, exam.value, subject.value, score.value, imagesJson).run()
+
+  return jsonResp({ success: true, replaced: !!existing, score: score.value })
+}
+
+// 修改单条成绩（教师/管理员）
+// body 里没给的字段保持原值；images 显式传了才替换（传 [] 表示清空附件）。
+async function handleUpdateScore(request, env, teacher, studentId, scoreId) {
+  const loaded = await loadScoreTarget(env, teacher, studentId, scoreId)
+  if (loaded.response) return loaded.response
+  const { row } = loaded
+
+  const body = await request.json().catch(() => ({}))
+  const exam = normalizeExamName(body.exam_name ?? row.exam_name)
+  if (exam.error) return jsonResp({ error: exam.error }, 400)
+  const subject = normalizeSubject(body.subject ?? row.subject)
+  if (subject.error) return jsonResp({ error: subject.error }, 400)
+  const score = normalizeScore(body.score ?? row.score)
+  if (score.error) return jsonResp({ error: score.error }, 400)
+
+  let imagesJson = null
+  if (body.images !== undefined) {
+    if (!Array.isArray(body.images)) return jsonResp({ error: '附件格式不正确' }, 400)
+    if (body.images.length > 3) return jsonResp({ error: '附件最多 3 张' }, 400)
+    imagesJson = JSON.stringify(body.images)
+  }
+
+  const clash = await findScoreClash(env, studentId, exam.value, subject.value, scoreId)
+  if (clash) {
+    return jsonResp({
+      error: `该学生「${exam.value}」下已有「${subject.value}」成绩，请直接修改那一条，或换一个科目／考试名称`,
+      conflictId: clash.id
+    }, 409)
+  }
+
+  if (imagesJson === null) {
+    await env.DB.prepare(
+      `UPDATE scores SET exam_name = ?, subject = ?, score = ? WHERE id = ? AND student_id = ?`
+    ).bind(exam.value, subject.value, score.value, scoreId, studentId).run()
+  } else {
+    await env.DB.prepare(
+      `UPDATE scores SET exam_name = ?, subject = ?, score = ?, images = ? WHERE id = ? AND student_id = ?`
+    ).bind(exam.value, subject.value, score.value, imagesJson, scoreId, studentId).run()
+  }
+
+  return jsonResp({ success: true, scoreId: Number(scoreId) })
+}
+
+// 删除单条成绩（教师/管理员）
+// 只删这一条记录，不碰其它科目 —— 录错一科不该让整场考试消失。
+async function handleDeleteScore(request, env, teacher, studentId, scoreId) {
+  const loaded = await loadScoreTarget(env, teacher, studentId, scoreId)
+  if (loaded.response) return loaded.response
+  await env.DB.prepare(
+    `DELETE FROM scores WHERE id = ? AND student_id = ?`
+  ).bind(scoreId, studentId).run()
+  return jsonResp({ success: true, removed: loaded.row })
 }
 
 async function handleAddEvent(request, env, studentId) {
@@ -2158,7 +2297,19 @@ export async function onRequest(context) {
   if (path.match(/^\/student\/[^/]+\/score$/) && method === 'POST') {
     const { user: teacher, response: r } = await requireTeacher(request, env)
     if (r) return r
-    return handleAddScore(request, env, path.split('/')[2])
+    return handleAddScore(request, env, teacher, path.split('/')[2])
+  }
+
+  // 修改 / 删除单条成绩 —— 录入有误时的改正入口。
+  // 定位用成绩行主键（前端从 /student/:id 的 _ids 里拿到），而不是 (考试,科目)：
+  // 主键在「改科目」这种场景下依然指向同一条记录，(考试,科目) 会自相矛盾。
+  if (path.match(/^\/student\/[^/]+\/score\/[^/]+$/) && (method === 'PUT' || method === 'DELETE')) {
+    const { user: teacher, response: r } = await requireTeacher(request, env)
+    if (r) return r
+    const parts = path.split('/').filter(Boolean) // ['student', 学号, 'score', 成绩行id]
+    return method === 'PUT'
+      ? handleUpdateScore(request, env, teacher, parts[1], parts[3])
+      : handleDeleteScore(request, env, teacher, parts[1], parts[3])
   }
 
   if (path.match(/^\/student\/[^/]+\/event$/) && method === 'POST') {

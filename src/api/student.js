@@ -176,7 +176,9 @@ export async function bulkDeleteStudents(ids) {
 }
 
 // 教师添加单条成绩
-// payload: { examName, subject, score }
+// payload: { subject, exam_name, score, images? }（images 为压缩后的 dataURL 数组，最多 3 张）
+// 返回 { success, replaced } —— replaced=true 表示同一场考试的同一科目已有记录，
+// 这次是覆盖更新（行为等同于改正），页面据此给出不同措辞。
 export async function addScore(studentId, payload) {
   if (USE_WORKER) {
     return fetchJSON(`${API}/student/${studentId}/score`, {
@@ -184,6 +186,28 @@ export async function addScore(studentId, payload) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     })
+  }
+  return { success: true }
+}
+
+// 修改单条成绩（教师/管理员）—— 录入有误时的改正入口。
+// scoreId 是成绩行主键，由 GET /student/:id 返回的 scores[]._ids[科目] 提供。
+// payload 里没给的字段保持原值；images 只在真的改了附件时才传（传 [] 表示清空）。
+export async function updateScore(studentId, scoreId, payload) {
+  if (USE_WORKER) {
+    return fetchJSON(`${API}/student/${studentId}/score/${scoreId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+  }
+  return { success: true }
+}
+
+// 删除单条成绩（教师/管理员）—— 只删这一科，不动同场考试的其它科目
+export async function deleteScore(studentId, scoreId) {
+  if (USE_WORKER) {
+    return fetchJSON(`${API}/student/${studentId}/score/${scoreId}`, { method: 'DELETE' })
   }
   return { success: true }
 }

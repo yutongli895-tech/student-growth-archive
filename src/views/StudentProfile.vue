@@ -111,6 +111,18 @@
       <p v-if="scoreMsg" :class="['msg', scoreMsgType]">{{ scoreMsg }}</p>
     </div>
 
+    <!-- 成绩记录：录入有误的改正入口（同在编辑模式管辖下）
+         放在「添加成绩」正下方 —— 录入和改正本来就是一回事，
+         分成两个相距很远的地方，教师会在页面上来回找。 -->
+    <ScoreRecordList
+      v-if="canEdit"
+      ref="scoreListRef"
+      :scores="student.scores"
+      :student-id="student.id"
+      :subjects="subjects"
+      @changed="reloadStudent"
+    />
+
     <!-- 成绩详情弹窗（点击图表触发） -->
     <div v-if="showExamModal" class="modal-overlay" @click.self="showExamModal=false">
       <div class="modal exam-modal">
@@ -121,7 +133,14 @@
         <div class="modal-body">
           <div v-if="Object.keys(examDetail.scores).length" class="score-row-list">
             <div v-for="(v, subj) in examDetail.scores" :key="subj" class="score-row">
-              <span>{{ subj }}</span><span>{{ v }}</span>
+              <span>{{ subj }}</span>
+              <span class="score-row-val">{{ v }}</span>
+              <button
+                v-if="canEdit"
+                class="score-row-edit"
+                :title="`修改 ${examDetail.exam} · ${subj} 的成绩`"
+                @click="editFromExamModal(subj)"
+              >✏️</button>
             </div>
           </div>
           <div v-if="examDetail.images && examDetail.imagesCount > 0" class="exam-images">
@@ -276,8 +295,10 @@ import { useRoute } from 'vue-router'
 import { getStudent, generateAIReport, getSubjects, addScore, addEvent, deleteEvent, updateBehavior, updateHomework } from '../api/student.js'
 import { getRole } from '../api/auth.js'
 import { useEditMode, setEditMode } from '../utils/editMode.js'
+import { collectImages, MAX_IMAGES } from '../utils/imageCompress.js'
 import ScoreTrendChart from '../components/ScoreTrendChart.vue'
 import BehaviorRadar from '../components/BehaviorRadar.vue'
+import ScoreRecordList from '../components/ScoreRecordList.vue'
 
 const route = useRoute()
 const student = ref(null)
@@ -289,12 +310,17 @@ const aiError = ref('')
 const subjects = ref([])
 const isStaff = getRole() === 'teacher' || getRole() === 'admin'
 
+// 成绩记录组件（修改/删除成绩的入口在那个组件里，这里只负责重新拉档案）
+const scoreListRef = ref(null)
+
 // 编辑权限来自全局开关（顶栏那个），本页不再自己维护第二份状态。
 // canEdit = 教职工 且 编辑模式已开启；学生/家长在这个 computed 里就被挡住了。
 const { editMode, canEdit, toggleEditMode } = useEditMode()
 
 // 关闭编辑模式时，若还有编辑弹窗开着，一并收起。
 // 否则会出现「开关已关，弹窗里的保存按钮仍可提交」的旁路。
+// 成绩记录的弹窗不用在这里关 —— 那张卡片整个由 v-if="canEdit" 控制，
+// 开关一关卡片连同弹窗一起卸载，不存在残留的旁路。
 watch(editMode, on => {
   if (!on) {
     behaviorEditing.value = false
@@ -346,61 +372,14 @@ const behaviorFields = {
 }
 
 // ========== 成绩附件 ==========
-const MAX_IMGS = 3
-const MAX_SIZE = 1 * 1024 * 1024 // 1MB 压缩后上限
-const MAX_WIDTH = 1600 // 缩放上限
-
-async function compressImage(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onerror = () => reject(new Error('读取失败'))
-    reader.onload = ev => {
-      const img = new Image()
-      img.onerror = () => reject(new Error('解码失败'))
-      img.onload = () => {
-        let { width, height } = img
-        if (width > MAX_WIDTH) {
-          height = Math.round(height * (MAX_WIDTH / width))
-          width = MAX_WIDTH
-        }
-        const canvas = document.createElement('canvas')
-        canvas.width = width
-        canvas.height = height
-        const ctx = canvas.getContext('2d')
-        ctx.drawImage(img, 0, 0, width, height)
-        try {
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.75)
-          resolve(dataUrl)
-        } catch (e) { reject(e) }
-      }
-      img.src = ev.target.result
-    }
-    reader.readAsDataURL(file)
-  })
-}
-
+// 压缩与「最多 3 张 / 1MB 上限」的规则统一放在 utils/imageCompress.js：
+// 添加成绩和修改成绩都要挂附件，规则写两份迟早会不一致。
 async function onImgChange(e) {
-  const files = Array.from(e.target.files || [])
-  scoreMsg.value = ''
-  for (const file of files) {
-    if (scoreForm.value.images.length >= MAX_IMGS) break
-    if (!file.type.startsWith('image/')) continue
-    try {
-      const src = await compressImage(file)
-      if (src.length > MAX_SIZE) {
-        scoreMsg.value = `"${file.name}" 仍超过 1MB，请选更小的图`
-        scoreMsgType.value = 'err'
-        continue
-      }
-      const kb = Math.round(src.length / 1024)
-      scoreForm.value.images.push({ src, name: `${file.name} (${kb}KB)` })
-      scoreMsg.value = `已压缩 ${file.name} → ${kb}KB`
-      scoreMsgType.value = 'ok'
-    } catch (err) {
-      scoreMsg.value = `"${file.name}" 压缩失败：${err.message}`
-      scoreMsgType.value = 'err'
-    }
-  }
+  const room = MAX_IMAGES - scoreForm.value.images.length
+  const { added, errors } = await collectImages(e.target.files, room)
+  if (added.length) scoreForm.value.images.push(...added)
+  if (errors.length) { scoreMsg.value = errors.join('；'); scoreMsgType.value = 'err' }
+  else if (added.length) { scoreMsg.value = `已附加 ${added.length} 张`; scoreMsgType.value = 'ok' }
   e.target.value = ''
 }
 
@@ -419,7 +398,9 @@ function openExamDetail({ exam }) {
   const scores = {}
   const imgs = {}
   for (const [k, v] of Object.entries(found)) {
-    if (k === 'exam' || k === '_images') continue
+    // _ids / _images 是下划线开头的辅助字段，不是科目。
+    // 判断题式地写死 '_images' 会漏掉后加的 _ids，把它当成一科画进弹窗。
+    if (k === 'exam' || k.startsWith('_')) continue
     if (Array.isArray(v)) continue
     scores[k] = v
   }
@@ -437,6 +418,19 @@ function openExamDetail({ exam }) {
   showExamModal.value = true
 }
 
+// 「点击图表 → 看到某科分数 → 发现录错了 → 就地改」这条路径要最短：
+// 直接把那一科交给成绩记录组件打开修改弹窗，然后收起查看弹窗，避免两层弹窗叠着。
+function editFromExamModal(subject) {
+  const opened = scoreListRef.value?.openBySubject(examDetail.value.exam, subject)
+  if (opened) {
+    showExamModal.value = false
+    return
+  }
+  // 拿不到成绩行主键（浏览器缓存着旧版页面）时不能静默什么都不做 ——
+  // 点了没反应会让教师以为功能坏了，这里说清原因和唯一的解法。
+  alert('这条成绩缺少行标识，无法定位到要修改的记录。请刷新页面（Ctrl+F5）后重试。')
+}
+
 // ========== 原有逻辑 ==========
 onMounted(async () => {
   student.value = await getStudent(route.params.id)
@@ -447,6 +441,18 @@ onMounted(async () => {
     aiSource.value = 'preset'
   }
 })
+
+// 成绩改动后重新拉一次档案，图表（成绩趋势）和记录列表同时刷新。
+// 不做局部改内存：均分、趋势点、_ids 都要重算，前端自己拼一份极易和库里的真实状态跑偏。
+async function reloadStudent() {
+  if (!student.value) return
+  try {
+    student.value = await getStudent(student.value.id)
+  } catch (e) {
+    scoreMsg.value = '刷新档案失败，请手动刷新页面：' + e.message
+    scoreMsgType.value = 'err'
+  }
+}
 
 async function regenerateAI() {
   if (!student.value) return
@@ -486,9 +492,13 @@ async function doAddScore() {
       images: base64s
     })
     if (r.success) {
-      scoreMsg.value = '成绩已添加' + (base64s.length ? `（含${base64s.length}张图片）` : ''); scoreMsgType.value = 'ok'
+      // 同一场考试的同一科目已存在时后端是覆盖更新（唯一约束），
+      // 说成「已添加」会让教师以为多录了一条，回头看到科目数没变又以为没保存。
+      const what = r.replaced ? '已更新原有成绩' : '成绩已添加'
+      scoreMsg.value = what + (base64s.length ? `（含${base64s.length}张图片）` : '')
+      scoreMsgType.value = 'ok'
       f.subject = ''; f.exam_name = ''; f.score = ''; f.images = []
-      student.value = await getStudent(student.value.id)
+      await reloadStudent()
     } else { scoreMsg.value = r.error || '添加失败'; scoreMsgType.value = 'err' }
   } catch (e) { scoreMsg.value = e.message; scoreMsgType.value = 'err' }
   scoreLoading.value = false
@@ -752,8 +762,16 @@ async function doSaveHomework() {
 .modal-close { background: none; border: none; cursor: pointer; font-size: 18px; color: #999; padding: 0; }
 .modal-body { padding: 16px 20px; max-height: 70vh; overflow-y: auto; }
 .score-row-list { display: flex; flex-direction: column; gap: 8px; }
-.score-row { display: flex; justify-content: space-between; padding: 8px 12px; background: #f8f9fa; border-radius: 6px; font-size: 14px; }
-.score-row span:last-child { font-weight: 600; color: var(--primary); }
+.score-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: #f8f9fa; border-radius: 6px; font-size: 14px; }
+.score-row > span:first-child { flex: 1; }
+.score-row-val { font-weight: 600; color: var(--primary); font-variant-numeric: tabular-nums; }
+/* 每科的「就地修改」入口：编辑模式下才出现，点击直接打开修改弹窗 */
+.score-row-edit {
+  background: none; border: none; cursor: pointer; padding: 2px 4px;
+  font-size: 13px; line-height: 1; border-radius: 4px; opacity: .7;
+  transition: opacity var(--transition-fast), background var(--transition-fast);
+}
+.score-row-edit:hover { opacity: 1; background: var(--primary-light); }
 .exam-images { margin-top: 12px; }
 .exam-img-grid { display: flex; gap: 8px; flex-wrap: wrap; }
 .exam-img { width: 80px; height: 80px; object-fit: cover; border-radius: 6px; cursor: zoom-in; border: 1px solid #e0e4ea; }

@@ -26,11 +26,14 @@ const LINE = '#e8ecf1'
 const hasData = computed(() => Array.isArray(props.scores) && props.scores.length > 0)
 
 // 从数据里推导科目，避免硬编码（原先固定 数学/英语/语文，其它科目不显示）
+// 下划线开头的是辅助字段（_images 附件、_ids 成绩行主键），不是科目 ——
+// 用 k.startsWith('_') 而不是逐个列举，免得每加一个辅助字段就要回来改这里
+// （漏改的后果是图表里冒出一个叫「_ids」的假科目）。
 function deriveSubjects() {
   const set = new Set()
   for (const s of props.scores) {
     for (const k of Object.keys(s)) {
-      if (k === 'exam' || k === '_images') continue
+      if (k === 'exam' || k.startsWith('_')) continue
       if (typeof s[k] === 'number') set.add(k)
     }
   }
