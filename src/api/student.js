@@ -24,8 +24,14 @@ async function fetchJSON(url, options = {}) {
 }
 
 // 返回全班概览列表
-export async function getStudents() {
-  if (USE_WORKER) return fetchJSON(`${API}/students`)
+// params = { class? } —— 仅管理员有效；教师端后端强制用其本班，忽略该参数
+export async function getStudents(params = {}) {
+  if (USE_WORKER) {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== '')
+    ).toString()
+    return fetchJSON(`${API}/students${qs ? '?' + qs : ''}`)
+  }
   return students.map(s => ({
     id: s.id, name: s.name, className: s.className,
     lastExam: s.scores[s.scores.length - 1], homeworkRate: s.homework.rate
@@ -58,6 +64,20 @@ export async function generateAIReport(studentId) {
 export async function getClassrooms() {
   if (USE_WORKER) return fetchJSON(`${API}/classrooms`)
   return ['高三(2)班']
+}
+
+// 学科成绩分析（班级概览的图表数据源）
+// params = { class? } —— 仅管理员的有效，教师端后端会强制用其本班，忽略该参数
+// 返回：{ scope, thresholds, exams, subjects, recordCount }
+// 聚合在服务端 SQL 内完成，前端只负责画图（不要在这里二次拉全量成绩）
+export async function getSubjectAnalysis(params = {}) {
+  if (USE_WORKER) {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== '')
+    ).toString()
+    return fetchJSON(`${API}/stats/subject-analysis${qs ? '?' + qs : ''}`)
+  }
+  return { scope: { class: null, label: '全部班级', studentCount: 0 }, thresholds: { pass: 60, good: 70, excellent: 85 }, exams: [], subjects: [], recordCount: 0 }
 }
 
 // 教师列表（仅管理员）

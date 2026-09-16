@@ -47,12 +47,19 @@
       </div>
     </template>
 
-    <!-- ================= 教师 / 管理员视角 ================= -->
+    <!-- ================= 教师 / 管理员视角 =================
+         信息层级：班级摘要 → 学科成绩分析 → 学生名单。
+         「概览」的主体是班级整体，学生名单属于下钻明细，因此排在分析之后。 -->
     <template v-else>
       <div class="card">
         <div class="row between">
-          <h2 style="margin:0">班级概览 · {{ className || '—' }}</h2>
+          <h2 style="margin:0">班级概览 · {{ scopeLabel }}</h2>
           <div class="row">
+            <!-- 班级选择只给管理员：教师由后端强制限定本班，前端不给越权的入口 -->
+            <select v-if="isAdmin" v-model="classFilter" class="select select-sm" aria-label="选择班级">
+              <option value="">全部班级</option>
+              <option v-for="c in classrooms" :key="c" :value="c">{{ c }}</option>
+            </select>
             <button v-if="isStaff" class="btn outline" @click="$router.push('/homework')">
               📋 作业管理
             </button>
@@ -79,6 +86,12 @@
             <div class="sub">需关注学生<template v-if="needAttention && isStaff">（点击查看）</template></div>
           </div>
         </div>
+      </div>
+
+      <!-- ================= 各学科成绩分析 ================= -->
+      <div class="card">
+        <h2>各学科成绩分析</h2>
+        <ClassScoreAnalysis :data="analysis" :loading="analysisLoading" :error="analysisError" />
       </div>
 
       <div class="card">
@@ -112,20 +125,37 @@
 </template>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue'
-import { getStudents } from '../api/student.js'
+import { ref, onMounted, computed, watch } from 'vue'
+import { getStudents, getClassrooms, getSubjectAnalysis } from '../api/student.js'
 import { getRole } from '../api/auth.js'
+import ClassScoreAnalysis from '../components/ClassScoreAnalysis.vue'
 
 const role = getRole()
-const isStaff = role === 'teacher' || role === 'admin'
+const isAdmin = role === 'admin'
+const isStaff = role === 'teacher' || isAdmin
 const isStudent = role === 'student'
 
 const list = ref([])
-const className = ref('')
 const loadError = ref('')
+
+// 班级范围：管理员可选，教师端后端强制用本班（前端不给越权入口）
+const classrooms = ref([])
+const classFilter = ref('')
+
+// 学科成绩分析（聚合在服务端完成，这里只存结果）
+const analysis = ref(null)
+const analysisLoading = ref(false)
+const analysisError = ref('')
 
 // 学生视角：后端只返回本人，这里取第一条即为「我」
 const me = computed(() => (isStudent ? list.value[0] || null : null))
+
+// 标题里的班级范围。管理员没选班级时代表全校合计，要说清楚是「全部班级」，
+// 不能像以前那样拿名单里第一个学生的班级当标题（那是错的）。
+const scopeLabel = computed(() => {
+  if (isAdmin) return classFilter.value || '全部班级'
+  return classrooms.value[0] || list.value[0]?.className || '—'
+})
 
 // 把最近一次考试的科目分数摊平，便于逐科展示
 const myLastExam = computed(() => {
@@ -147,14 +177,44 @@ const avgRate = computed(() => {
 
 const needAttention = computed(() => list.value.filter(s => (Number(s.homeworkRate) || 0) < 0.9).length)
 
-onMounted(async () => {
+async function loadStudents() {
+  loadError.value = ''
   try {
-    list.value = await getStudents()
-    if (!isStudent && list.value.length) className.value = list.value[0].className
+    list.value = (await getStudents({ class: classFilter.value })) || []
   } catch (e) {
     loadError.value = e.message
     list.value = []
   }
+}
+
+async function loadAnalysis() {
+  analysisLoading.value = true
+  analysisError.value = ''
+  try {
+    analysis.value = await getSubjectAnalysis({ class: classFilter.value })
+  } catch (e) {
+    analysisError.value = e.message
+    analysis.value = null
+  } finally {
+    analysisLoading.value = false
+  }
+}
+
+// 切班级时两份数据一起重拉，避免列表与分析显示两个不同的班
+watch(classFilter, () => {
+  if (!isStaff) return
+  loadStudents()
+  loadAnalysis()
+})
+
+onMounted(async () => {
+  if (isStaff) {
+    // 班级列表拿不到不影响主流程（教师端本来也没有选择器）
+    try { classrooms.value = await getClassrooms() } catch { classrooms.value = [] }
+    await Promise.all([loadStudents(), loadAnalysis()])
+    return
+  }
+  await loadStudents()
 })
 </script>
 
@@ -172,6 +232,9 @@ onMounted(async () => {
 .empty-state .sub { font-size: 12px; }
 .msg { padding: 10px 16px; border-radius: var(--radius-sm); font-size: 14px; }
 .msg.err { background: var(--danger-light); color: var(--danger); }
+
+/* 班级选择器：与作业管理页保持同一尺寸，避免同一控件在两页长得不一样 */
+.select-sm { padding: 6px 10px; font-size: 13px; }
 
 /* 学生视角的本人信息行 */
 .me-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-top: 16px; }

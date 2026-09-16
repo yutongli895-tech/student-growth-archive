@@ -947,6 +947,151 @@ async function handleListClassrooms(request, env, user) {
   return jsonResp(results.map(r => r.class_name).filter(n => isRealClassName(n)))
 }
 
+// ===== 学科成绩分析（班级概览）=====
+// 设计约束（沿用本项目踩过的两个坑）：
+// ① 聚合全部下推到 SQL。绝不能「把全班成绩取回前端再算」——那是大结果集，
+//    人数一多就撞 Cloudflare 的 CPU/内存上限，表现为 503（dbGetStudents 的老病）。
+//    这里固定 4 条聚合查询，条数与学生数、成绩条数都无关。
+// ② 班级过滤用 JOIN users 完成，而不是「先查 id 列表再 IN (...)」：
+//    后者要 chunksOf 分片、还要防 D1 的 100 参数上限，前者一条 SQL 就干净。
+// ③ 只读接口也必须限教师/管理员：班级层面的横向对比属于管理数据，
+//    学生端可见就等于把全班成绩公开（与 /students 的信息隔离规则一致）。
+const SCORE_PASS = 60        // 及格线
+const SCORE_GOOD = 70        // 良好线
+const SCORE_EXCELLENT = 85   // 优秀线
+
+async function handleGetSubjectAnalysis(request, env, user, url) {
+  // 范围：管理员可用 ?class= 选班（空 / 哨兵 = 全部班级）；
+  // 教师只看自己的班，**忽略 query**，避免改 URL 越权看别的班。
+  let scopeClass = null
+  if (user.role === 'admin') {
+    const n = normalizeClassName(url.searchParams.get('class') || '')
+    scopeClass = isRealClassName(n) ? n : null
+  } else {
+    const n = normalizeClassName(user.className || '')
+    scopeClass = isRealClassName(n) ? n : null
+  }
+
+  const where = scopeClass ? `u.class_name = ?` : `1 = 1`
+  const args = scopeClass ? [scopeClass] : []
+
+  // 班级总人数（分母：用于「覆盖率」——有多少人还没成绩）
+  let scopeStudents = 0
+  try {
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) AS students FROM users u WHERE u.role = 'student' AND ${where}`
+    ).bind(...args).first()
+    scopeStudents = row ? row.students : 0
+  } catch { scopeStudents = 0 }
+
+  // ① 各学科汇总 + 达标分布（分档阈值与前端图例一一对应）
+  //    注意：分布按「成绩记录（人次）」计数，不是按人头 —— 一个人在 4 场考试
+  //    里就有 4 条记录。UI 上必须写「人次」，否则教师会把「不及格 8」读成 8 个人。
+  let subjectRows = []
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT s.subject AS subject,
+              COUNT(*) AS records,
+              COUNT(DISTINCT s.student_id) AS students,
+              ROUND(AVG(s.score), 1) AS avg,
+              MAX(s.score) AS max,
+              MIN(s.score) AS min,
+              SUM(CASE WHEN s.score >= ${SCORE_EXCELLENT} THEN 1 ELSE 0 END) AS excellent,
+              SUM(CASE WHEN s.score >= ${SCORE_GOOD} AND s.score < ${SCORE_EXCELLENT} THEN 1 ELSE 0 END) AS good,
+              SUM(CASE WHEN s.score >= ${SCORE_PASS} AND s.score < ${SCORE_GOOD} THEN 1 ELSE 0 END) AS pass,
+              SUM(CASE WHEN s.score < ${SCORE_PASS} THEN 1 ELSE 0 END) AS poor
+       FROM scores s
+       JOIN users u ON u.id = s.student_id
+       WHERE u.role = 'student' AND ${where}
+       GROUP BY s.subject`
+    ).bind(...args).all()
+    subjectRows = results || []
+  } catch { subjectRows = [] }
+
+  // ② 考试清单：参与人数与科目数。
+  //    scores 表没有考试日期列，只有自增 id；用 MIN(id) 排序 == 首次录入顺序，
+  //    与 dbGetStudent / ScoreTrendChart 依赖的「插入次序」语义保持一致。
+  let examRows = []
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT s.exam_name AS exam,
+              COUNT(*) AS records,
+              COUNT(DISTINCT s.student_id) AS students,
+              COUNT(DISTINCT s.subject) AS subjects,
+              MIN(s.id) AS first_id
+       FROM scores s
+       JOIN users u ON u.id = s.student_id
+       WHERE u.role = 'student' AND ${where}
+       GROUP BY s.exam_name
+       ORDER BY first_id`
+    ).bind(...args).all()
+    examRows = results || []
+  } catch { examRows = [] }
+
+  // ③ 学科 × 考试 的平均分：趋势线的数据源
+  let cellRows = []
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT s.exam_name AS exam,
+              s.subject AS subject,
+              ROUND(AVG(s.score), 1) AS avg,
+              COUNT(DISTINCT s.student_id) AS students
+       FROM scores s
+       JOIN users u ON u.id = s.student_id
+       WHERE u.role = 'student' AND ${where}
+       GROUP BY s.exam_name, s.subject`
+    ).bind(...args).all()
+    cellRows = results || []
+  } catch { cellRows = [] }
+
+  // 按考试名归拢趋势点，前端按 exam 名对齐到 x 轴
+  const pointsBySubject = new Map()
+  for (const c of cellRows) {
+    if (!pointsBySubject.has(c.subject)) pointsBySubject.set(c.subject, [])
+    pointsBySubject.get(c.subject).push({ exam: c.exam, avg: c.avg, students: c.students })
+  }
+
+  const subjects = subjectRows
+    .map(r => {
+      const records = r.records || 0
+      return {
+        subject: r.subject,
+        records,
+        students: r.students || 0,
+        avg: r.avg,
+        max: r.max,
+        min: r.min,
+        dist: {
+          excellent: r.excellent || 0,
+          good: r.good || 0,
+          pass: r.pass || 0,
+          poor: r.poor || 0
+        },
+        passRate: records ? Math.round(((records - (r.poor || 0)) / records) * 1000) / 1000 : 0,
+        excellentRate: records ? Math.round(((r.excellent || 0) / records) * 1000) / 1000 : 0,
+        byExam: pointsBySubject.get(r.subject) || []
+      }
+    })
+    .sort((a, b) => (b.avg || 0) - (a.avg || 0))
+
+  return jsonResp({
+    scope: {
+      class: scopeClass,
+      label: scopeClass || CLASS_FILTER_ALL,
+      studentCount: scopeStudents
+    },
+    thresholds: { pass: SCORE_PASS, good: SCORE_GOOD, excellent: SCORE_EXCELLENT },
+    exams: examRows.map(e => ({
+      exam: e.exam,
+      records: e.records || 0,
+      students: e.students || 0,
+      subjects: e.subjects || 0
+    })),
+    subjects,
+    recordCount: subjectRows.reduce((a, r) => a + (r.records || 0), 0)
+  })
+}
+
 async function handleAIReport(request, env, user) {
   const { studentId } = await request.json()
   if (user.role === 'student' && user.id !== studentId) {
@@ -1913,6 +2058,13 @@ export async function onRequest(context) {
     const { user: t, response: r } = await requireTeacher(request, env)
     if (r) return r
     return handleListClassrooms(request, env, t)
+  }
+
+  // 学科成绩分析（班级概览的图表数据源；教师/管理员）
+  if (path === '/stats/subject-analysis' && method === 'GET') {
+    const { user: t, response: r } = await requireTeacher(request, env)
+    if (r) return r
+    return handleGetSubjectAnalysis(request, env, t, url)
   }
 
   // 学生列表
