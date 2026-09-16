@@ -768,28 +768,42 @@ async function handleFixClassNames(request, env) {
     const { results: rooms } = await env.DB.prepare(`SELECT id, name FROM classrooms`).all()
     const fixedRooms = []
     const removedRooms = []
-    for (const r of rooms) {
+    const mergedRooms = []
+    // 先把「已经是规范名」的行登记下来。这样把「一年级（1）班」改成「一年级(1)班」时，
+    // 如果后者本来就存在，就知道该合并（删掉多出来的那一行），
+    // 而不是改名造出两行同名班级（下拉框用 Set 去重看不出来，但库里会一直留着脏行）。
+    const takenNames = new Set(
+      (rooms || []).filter(r => r.name === normalizeClassName(r.name)).map(r => r.name)
+    )
+    for (const r of rooms || []) {
       // 班级表里的哨兵与乱码行直接删掉：它们不是班级，留着只会让下拉框变成乱码墙
       if (!isRealClassName(r.name) || isCorruptClassName(r.name)) {
         await env.DB.prepare(`DELETE FROM classrooms WHERE id = ?`).bind(r.id).run()
         removedRooms.push({ id: r.id, name: r.name })
         continue
       }
-      if (fwRe.test(r.name)) {
-        const n = normalizeClassName(r.name)
-        await env.DB.prepare(`UPDATE classrooms SET name = ? WHERE id = ?`).bind(n, r.id).run()
-        fixedRooms.push({ id: r.id, from: r.name, to: n })
+      const n = normalizeClassName(r.name)
+      if (n === r.name) continue
+      if (takenNames.has(n)) {
+        // 规范名已被别的行占用 → 这行是重复登记，删掉即可
+        await env.DB.prepare(`DELETE FROM classrooms WHERE id = ?`).bind(r.id).run()
+        mergedRooms.push({ id: r.id, from: r.name, to: n })
+        continue
       }
+      await env.DB.prepare(`UPDATE classrooms SET name = ? WHERE id = ?`).bind(n, r.id).run()
+      takenNames.add(n)
+      fixedRooms.push({ id: r.id, from: r.name, to: n })
     }
 
     return jsonResp({
       success: true,
       fixedUsers, fixedRooms,
-      removedRooms,
+      removedRooms, mergedRooms,
       dirtyUsers,
       fixedUserCount: fixedUsers.length,
       fixedRoomCount: fixedRooms.length,
       removedRoomCount: removedRooms.length,
+      mergedRoomCount: mergedRooms.length,
       dirtyUserCount: dirtyUsers.length
     })
   } catch (e) {
