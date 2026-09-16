@@ -218,8 +218,8 @@
     <div class="card">
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
         <h2 style="margin:0">AI 成长画像与建议</h2>
-        <span v-if="aiSource" class="badge" :class="{ warn: aiSource === 'fallback' }">
-          {{ aiSource === 'ai' ? '✨ AI 实时生成' : '⚡ 预置报告' }}
+        <span v-if="aiSource" class="badge" :class="{ warn: aiSource !== 'ai' }">
+          {{ aiSource === 'ai' ? '✨ AI 实时生成' : (aiSource === 'cached' ? '🕘 上次生成的结果' : '⚡ 预置报告') }}
         </span>
         <span class="spacer" style="flex:1"></span>
         <button

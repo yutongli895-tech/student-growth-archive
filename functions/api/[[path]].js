@@ -1096,14 +1096,99 @@ async function handleGetSubjectAnalysis(request, env, user, url) {
   })
 }
 
+// ---- AI 报告：把档案压成「给模型看」的摘要 ----
+//
+// 成绩记录里的 _images 是附件的 base64 dataURL（单张上限 1MB），_ids 是行主键。
+// 两者对模型毫无意义，但 JSON.stringify 会把它们原样塞进提示词 —— 几个附件就能把
+// 请求体顶到几十 MB，既烧 token 又可能撞上平台/网关的体积与时长限制
+// （用户侧表现为一个没有任何错误详情的 502）。所以摘要必须显式剥掉 _ 前缀字段。
+function aiProfileSummary(student) {
+  const exams = (student.scores || []).map(exam => {
+    const row = { 考试: exam.exam }
+    for (const [k, v] of Object.entries(exam)) {
+      if (k === 'exam' || k.startsWith('_')) continue
+      row[k] = v
+    }
+    const imgs = exam._images || {}
+    const n = Object.values(imgs).reduce((a, arr) => a + (Array.isArray(arr) ? arr.length : 0), 0)
+    if (n) row.附件张数 = n          // 只报张数，不报内容
+    return row
+  })
+  return {
+    姓名: student.name,
+    班级: student.className,
+    成绩记录: exams,
+    作业情况: student.homework,
+    作业明细: (student.homeworkDetail || []).slice(0, 10),
+    课堂行为: student.behavior,
+    重要事件: (student.events || []).slice(0, 20)
+  }
+}
+
+// 上游 AI 网关调用：带超时 + 对限流/5xx 退避重试一次。
+//
+// 两个刻意的选择：
+//   1) 必须给 signal。不带超时的话，上游卡住时请求会一直挂着，最后被平台掐掉 ——
+//      前端拿到的是一个没有 error 字段的 HTML 错误页，界面上只剩一句「请求失败: 502」，
+//      既定位不到原因，也没法给用户任何可行提示。
+//   2) 429 要退避重试。免费额度按并发/频率限流，隔一秒半再试往往就过了；
+//      实测连续生成时第 3 次起就全是 429。
+const AI_TIMEOUT_MS = 25000
+
+async function callAIUpstream(env, messages) {
+  const base = String(env.AGNES_BASE_URL || 'https://apihub.agnes-ai.com/v1').replace(/\/+$/, '')
+  const once = async () => {
+    const resp = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(env.AGNES_API_KEY ? { Authorization: `Bearer ${env.AGNES_API_KEY}` } : {})
+      },
+      body: JSON.stringify({
+        model: env.AGNES_MODEL,
+        messages,
+        temperature: 0.7,
+        max_tokens: 2000
+      }),
+      signal: AbortSignal.timeout(AI_TIMEOUT_MS)
+    })
+    if (resp.ok) return { ok: true, data: await resp.json() }
+    // 上游的错误体里有可读原因（如 "Invalid token" / 额度用尽），尽量带出来
+    let hint = ''
+    try {
+      const text = await resp.text()
+      try { hint = JSON.parse(text)?.error?.message || '' } catch { hint = text.slice(0, 180) }
+    } catch {}
+    return { ok: false, status: resp.status, hint }
+  }
+
+  let r = await once()
+  if (!r.ok && (r.status === 429 || r.status >= 500)) {
+    await new Promise(res => setTimeout(res, 1500))
+    r = await once()
+  }
+  return r
+}
+
 async function handleAIReport(request, env, user) {
-  const { studentId } = await request.json()
-  if (user.role === 'student' && user.id !== studentId) {
-    return jsonResp({ error: '无权查看其他学生档案' }, 403)
+  let studentId = ''
+  try { ({ studentId } = await request.json()) } catch { return jsonResp({ error: '请求体格式有误' }, 400) }
+  if (!studentId) return jsonResp({ error: '缺少学生 ID' }, 400)
+
+  // 权限：教师/管理员可生成；学生仅限本人。
+  // 家长端本来就不展示 AI 报告（handleParentStudent 已在服务端剔除该字段），
+  // 所以这里直接拒绝 —— 否则任何已登录账号都能拿别班学号白嫖 AI 额度。
+  if (user.role === 'student') {
+    if (user.id !== studentId) return jsonResp({ error: '无权查看其他学生档案' }, 403)
+  } else if (user.role !== 'teacher' && user.role !== 'admin') {
+    return jsonResp({ error: '需要教师或管理员权限' }, 403)
   }
 
   const student = await dbGetStudent(env, studentId)
   if (!student) return jsonResp({ error: '未找到该学生' }, 404)
+  if (teacherOutOfScope(user, student.className)) {
+    return jsonResp({ error: '无权操作其他班级学生的报告' }, 403)
+  }
 
   const AI_SYSTEM_PROMPT = `你是一位资深的班主任兼学习分析师。请根据学生的学业数据、课堂行为数据和历史事件，生成一份个性化的成长档案报告。
 
@@ -1122,52 +1207,62 @@ async function handleAIReport(request, env, user) {
   "talkScript": "给家长的一段话，口语化，100字以内"
 }`
 
-  const dataSummary = {
-    姓名: student.name, 班级: student.className,
-    成绩记录: student.scores, 作业情况: student.homework,
-    课堂行为: student.behavior, 重要事件: student.events
-  }
+  const dataSummary = aiProfileSummary(student)
 
+  // 失败时兜底：已经生成过的报告，比一句报错有用得多
+  const cached = student.aiReport
+  const giveUp = (status, message) => cached
+    ? jsonResp({ ...cached, _source: 'cached', _error: message })
+    : jsonResp({ error: message }, status)
+
+  let upstream
   try {
-    const agnesUrl = env.AGNES_BASE_URL || 'https://apihub.agnes-ai.com/v1'
-  const resp = await fetch(`${agnesUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${env.AGNES_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: env.AGNES_MODEL,
-        messages: [
-          { role: 'system', content: AI_SYSTEM_PROMPT },
-          { role: 'user', content: `请根据以下学生数据生成成长档案报告：\n\n${JSON.stringify(dataSummary, null, 2)}` }
-        ],
-        temperature: 0.7, max_tokens: 2000
-      })
-    })
-
-    if (!resp.ok) {
-      return jsonResp({ error: `AI 服务返回 ${resp.status}` }, 502)
-    }
-
-    const data = await resp.json()
-    let content = (data.choices?.[0]?.message?.content || '').trim()
-    if (content.startsWith('```')) {
-      content = content.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '')
-    }
-
-    let report
-    try { report = JSON.parse(content) }
-    catch { report = { profile: content, weaknesses: [], suggestions: [], talkScript: '', _parseError: true } }
-
-    await env.DB.prepare(
-      `INSERT INTO ai_reports (student_id, report_json) VALUES (?, ?)`
-    ).bind(studentId, JSON.stringify(report)).run()
-
-    return jsonResp({ ...report, _source: 'ai' })
+    upstream = await callAIUpstream(env, [
+      { role: 'system', content: AI_SYSTEM_PROMPT },
+      { role: 'user', content: `请根据以下学生数据生成成长档案报告：\n\n${JSON.stringify(dataSummary, null, 2)}` }
+    ])
   } catch (err) {
-    return jsonResp({ error: 'AI 服务异常: ' + err.message }, 500)
+    const timedOut = err.name === 'TimeoutError' || err.name === 'AbortError'
+    return giveUp(504, timedOut
+      ? `AI 服务响应超时（超过 ${AI_TIMEOUT_MS / 1000} 秒），请稍后重试`
+      : 'AI 服务连接失败: ' + err.message)
   }
+
+  if (!upstream.ok) {
+    // 限流要说人话：这是「等一会儿再来」，不是「系统坏了」
+    if (upstream.status === 429) {
+      return giveUp(429, 'AI 服务当前请求过多（免费额度限流），请等 30 秒左右再试')
+    }
+    if (upstream.status === 401 || upstream.status === 403) {
+      return giveUp(502, 'AI 服务鉴权失败，请检查 AGNES_API_KEY 配置')
+    }
+    return giveUp(502, `AI 服务返回 ${upstream.status}${upstream.hint ? '：' + upstream.hint : ''}`)
+  }
+
+  const data = upstream.data
+  let content = (data.choices?.[0]?.message?.content || '').trim()
+  if (content.startsWith('```')) {
+    content = content.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '')
+  }
+
+  let report
+  try { report = JSON.parse(content) }
+  catch { report = { profile: content, weaknesses: [], suggestions: [], talkScript: '', _parseError: true } }
+
+  // 一个学生只保留最新一份报告。读的时候是 ORDER BY generated_at DESC LIMIT 1，
+  // 旧实现每次生成都 INSERT，旧行纯属死数据（线上已经堆了多条）。
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`DELETE FROM ai_reports WHERE student_id = ?`).bind(studentId),
+      env.DB.prepare(`INSERT INTO ai_reports (student_id, report_json) VALUES (?, ?)`)
+        .bind(studentId, JSON.stringify(report))
+    ])
+  } catch (e) {
+    // 落库失败不该把刚生成的报告扔掉 —— 照常返回，只是下次还得再生成一次
+    return jsonResp({ ...report, _source: 'ai', _persistError: e.message })
+  }
+
+  return jsonResp({ ...report, _source: 'ai' })
 }
 
 // ===== 单条成绩：增 / 改 / 删 =====
