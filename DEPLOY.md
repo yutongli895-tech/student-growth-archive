@@ -418,8 +418,16 @@ npx wrangler d1 execute student-growth-archive --remote -y \
 | 设置 → 环境变量 | `NODE_VERSION=22`（Production 和 Preview 都加） |
 | 设置 → 环境变量 | （可选）`AGNES_API_KEY` / `AGNES_BASE_URL` / `AGNES_MODEL`，加密变量 |
 
-⚠️ **绑定和环境变量是"部署时注入"的，改完必须重新部署一次**（Deployments → ⋯ → 重试部署），
-光保存设置不生效。
+⚠️ **绑定和环境变量是"部署时注入"的，改完必须重新部署一次**，光保存设置不生效。
+但"重新部署"有两种，**用错等于没做**：
+
+- **只改了控制台设置**（绑定 / 环境变量）→ Deployments → ⋯ → **重试部署**，重放本次部署并带上新绑定。
+- **改了仓库里的代码或 `wrangler.toml`** → 重试部署**没有用**：Retry 重放的是**同一个 commit**，
+  不会去拉最新代码（表现就是"我明明改了、部署日志里却还是旧提交"）。
+  必须推一个新提交：`git commit --allow-empty -m "redeploy" && git push`。
+
+想确认某次部署到底跑的哪份代码：看 Deployments 那条记录的 commit，
+与 `git rev-parse HEAD` 对一下 —— 对不上就是重放了旧提交。
 
 ### 13.5 搬数据（可选）
 
