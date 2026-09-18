@@ -392,7 +392,10 @@ npx wrangler d1 execute student-growth-archive --remote --file=schema/baseline.s
 ```
 
 ⚠️ `--remote` 必须加，否则 SQL 只写进本地模拟库，线上会一直报"表不存在"。
-`baseline.sql` 含 11 张表 + 2 个索引，建完不需要再做别的。
+`baseline.sql` 含 11 张表 + 4 个索引，建完不需要再做别的。
+
+> 不想装 Node / wrangler 也可以：**建表和管理员两步都能直接在 Cloudflare 控制台的
+> D1 查询框里完成**，做法见 13.7。控制台默认操作的就是远程库，反而没有 `--remote` 这个坑。
 
 ### 13.3 造初始管理员（跳过这步就登不进去）
 
@@ -452,3 +455,55 @@ npx wrangler d1 execute student-growth-archive --remote --file=old-data.sql -y
 
 详细版操作手册（含逐步命令、截图级说明、常见报错速查表）见工作区文档
 `部署到新CF账号-操作手册.html`。
+
+### 13.7 路线 B：全程用 Cloudflare 控制台（不装 Node / wrangler）
+
+等价路线。控制台里的 D1 查询框走的是 D1 的 `/query` 接口，官方文档原话是
+「Supports multiple statements, joined by semicolons, which will be executed as a batch」——
+**把整份 `schema/baseline.sql` 全文粘进去一次执行就可以**，不需要逐条点。
+
+1. 控制台 → **Workers 和 Pages → D1** → 选中本项目的库
+2. 打开 **Query / 控制台** 标签 → 把 `schema/baseline.sql` 的**建表部分**整段粘进输入框
+3. **按 Ctrl+A 全选，再点 Execute** —— 某些版本只会执行光标所在的那一条语句，
+   不全选的话很可能只建出一张表，而且它不报错，事后才发现「表不存在」
+4. 验证：
+
+```sql
+SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name;
+```
+
+应返回 **11 行**（ai_reports / behavior / classrooms / events / homework /
+homework_assignments / homework_records / invite_codes / parent_links / scores / users）。
+
+5. 在同一输入框里执行管理员 INSERT：
+
+```sql
+INSERT INTO users (id, account, password_hash, role, name, class_name, status, must_change_pwd, created_by)
+VALUES ('A001', 'admin', '8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918',
+        'admin', '管理员', NULL, 'active', 1, 'bootstrap');
+```
+
+上面这个哈希对应密码 `admin`；`must_change_pwd = 1` 会让首次登录强制跳到改密页。
+想用自己的密码，先算 SHA-256（三种都行，**别用会带换行符的 `echo`**）：
+
+```powershell
+# Windows PowerShell，不需要装任何东西
+$b=[Text.Encoding]::UTF8.GetBytes('你的密码')
+[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($b)).Replace('-','').ToLower()
+```
+
+```bash
+node -e "console.log(require('crypto').createHash('sha256').update('你的密码').digest('hex'))"
+printf '你的密码' | sha256sum      # printf 不加换行，echo 会多加一个 \n
+```
+
+⚠️ 两条路线**都要注意**：
+- `class_name` 必须 `NULL`（见 13.3 的说明）；
+- 控制台建库时要确认选中的库就是 `wrangler.toml` 里 `database_id` 那一个——
+  账号里若存在多个同名库，选错会出现在 A 库建表、B 库报「表不存在」的怪现象。
+
+**控制台做不到的事**：它只能操作数据库，改不了 Pages 的绑定和环境变量 ——
+那两项仍然得在控制台的项目设置里配（13.4），并且**改完必须重新部署**。
+
+**这个项目已被验证过**：`schema/baseline.sql` 全文一次性执行可建出 11 张表 + 4 个索引，
+生成列、唯一约束、管理员 INSERT 与 `sha256('admin')` 登录校验均已用真实 SQLite 跑通。
