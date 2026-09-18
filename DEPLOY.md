@@ -357,6 +357,18 @@ git -c credential.helper= -c credential.helper=store push origin main
 
 1. **`wrangler.toml` 里的两个资源 ID 是账号级的，不能复用。**
    `database_id` 和 KV 的 `id` 都属于原账号，新账号里不存在。必须新建后替换。
+   漏做这步的表现是**构建全绿、只在部署最后一步失败**：
+
+   ```
+   Error: Failed to publish your Function. Got error:
+   KV namespace '64846c6738274df3988cae507eed035d' not found.
+   Verify the namespace exists in your account and that the namespace_id
+   in your configuration is correct.
+   ```
+
+   注意 `wrangler.toml` 里声明的绑定**优先级高于控制台**：在 Pages 控制台里
+   手动配一遍绑定绕不过它，必须改这个文件（或者把这两个绑定块从文件里删掉、
+   完全交给控制台 —— 那样 fork 以后 `git pull` 上游不会冲突，代价是配置不在代码里）。
 2. **新库是空的，而且没有"首个用户自动成为管理员"的逻辑。**
    `POST /auth/register` 必须带邀请码，而 `POST /admin/invite-codes` 只有管理员能调 ——
    全新库 → 无管理员 → 发不出邀请码 → 一个账号都注册不了。
