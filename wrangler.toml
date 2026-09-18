@@ -5,8 +5,8 @@ pages_build_output_dir = "dist"
 [[d1_databases]]
 binding = "DB"
 database_name = "student-growth-archive"
-database_id = "567d940d-75b6-4b1c-95fb-f2e377e27559"
+database_id = "74c0f956-c3f3-4de8-9c77-2a5195379679"
 
 [[kv_namespaces]]
 binding = "SESSIONS"
-id = "64846c6738274df3988cae507eed035d"
+id = "f19bac20013542a4bd3fe725a1ad3bf7"
