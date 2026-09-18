@@ -345,3 +345,90 @@ git -c credential.helper= -c credential.helper=store push origin main
 （第一个空值清空 helper 列表，第二个只留 `store`，凭据取自 `~/.git-credentials`。）
 另注：push 成功后**输出可能是空的**，不要据此判断失败，一律用
 `git ls-remote origin refs/heads/main` 核对 SHA。
+
+---
+
+## 13. 部署到另一个 Cloudflare 账号（fork 之后必读）
+
+上面的步骤假设你用的是**原来那个账号**。如果你 fork 了仓库、要部署到**另一个 CF 账号**，
+有三条硬约束必须先知道，否则一定卡住：
+
+### 13.1 三个"不换就不行"的点
+
+1. **`wrangler.toml` 里的两个资源 ID 是账号级的，不能复用。**
+   `database_id` 和 KV 的 `id` 都属于原账号，新账号里不存在。必须新建后替换。
+2. **新库是空的，而且没有"首个用户自动成为管理员"的逻辑。**
+   `POST /auth/register` 必须带邀请码，而 `POST /admin/invite-codes` 只有管理员能调 ——
+   全新库 → 无管理员 → 发不出邀请码 → 一个账号都注册不了。
+   **必须手工往新库插一条管理员**，见 13.3。
+3. **密码存的是 SHA-256 哈希（无盐）**，不是明文。自己造账号要先算哈希。
+
+> 好消息：前端 API 基址是相对路径 `/api`（同源），
+> **换域名不需要改任何前端代码**。
+
+### 13.2 建库、建表
+
+```bash
+npx wrangler logout && npx wrangler login && npx wrangler whoami   # 先确认登录的是新账号
+
+npx wrangler d1 create student-growth-archive        # 拿到 database_id
+npx wrangler kv namespace create SESSIONS            # 拿到 KV id
+
+# 把两个 ID 填进 wrangler.toml（binding 名 DB / SESSIONS 一个字都不能改）
+
+npx wrangler d1 execute student-growth-archive --remote --file=schema/baseline.sql -y
+```
+
+⚠️ `--remote` 必须加，否则 SQL 只写进本地模拟库，线上会一直报"表不存在"。
+`baseline.sql` 含 11 张表 + 2 个索引，建完不需要再做别的。
+
+### 13.3 造初始管理员（跳过这步就登不进去）
+
+```bash
+# 1) 算密码哈希（用 node，不要用会带换行符的 echo）
+node -e "console.log(require('crypto').createHash('sha256').update('你的密码').digest('hex'))"
+
+# 2) 插库
+npx wrangler d1 execute student-growth-archive --remote -y \
+  --command "INSERT INTO users (id, account, password_hash, role, name, class_name, status, must_change_pwd, created_by) VALUES ('A001','admin','<上一步的哈希>','admin','管理员',NULL,'active',0,'bootstrap')"
+```
+
+⚠️ **`class_name` 写 `NULL`，不要写「全部班级」** —— 那是界面筛选的哨兵值，
+不是班级名（见第 10 节，历史事故的起因）。管理员本来就不受班级限制，写 NULL 最干净。
+
+### 13.4 Pages 侧要配的东西
+
+| 位置 | 配置 |
+|---|---|
+| 构建配置 | 构建命令 `npm run build`；输出目录 `dist`；框架预设 Vite |
+| 生产分支 | 必须与你实际推送的分支一致（新项目默认 `main`） |
+| 设置 → 函数 → 绑定 | D1 变量名 **`DB`**、KV 变量名 **`SESSIONS`** |
+| 设置 → 环境变量 | `NODE_VERSION=22`（Production 和 Preview 都加） |
+| 设置 → 环境变量 | （可选）`AGNES_API_KEY` / `AGNES_BASE_URL` / `AGNES_MODEL`，加密变量 |
+
+⚠️ **绑定和环境变量是"部署时注入"的，改完必须重新部署一次**（Deployments → ⋯ → 重试部署），
+光保存设置不生效。
+
+### 13.5 搬数据（可选）
+
+```bash
+# 【老账号】导出（只导数据）
+npx wrangler d1 export student-growth-archive --remote --no-schema --output=old-data.sql
+# 【新账号】登录后导入
+npx wrangler d1 execute student-growth-archive --remote --file=old-data.sql -y
+```
+
+⚠️ 导出文件含全站 `password_hash`，别提交进仓库、别外传，用完删掉。
+⚠️ `--no-schema` 很重要，表结构用 13.2 那份 `baseline.sql` 建，别让导出文件覆盖。
+⚠️ 迁移来的账号可能残留 `class_name = '全部班级'`，用管理员调一次
+`POST /api/admin/fix-classnames` 清理。
+
+### 13.6 验收
+
+- `whoami` 是新账号 → `wrangler.toml` 两个 ID 已换 → 建表返回 11 张表 → `users` 里能看到管理员
+- 部署列表最新一条是 **Production**；绑定里 `DB` / `SESSIONS` 都在，且**已重新部署过**
+- 打开站点能登录（证明 D1 读 + KV 写通）；能新增一名学生（证明 D1 写通）
+- 发一个邀请码 → 用**无痕窗口**走一次注册（证明注册链路通）
+
+详细版操作手册（含逐步命令、截图级说明、常见报错速查表）见工作区文档
+`部署到新CF账号-操作手册.html`。
