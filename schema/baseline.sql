@@ -77,12 +77,17 @@ CREATE TABLE IF NOT EXISTS behavior (
 );
 
 -- ---------- 成长事件 ----------
+-- images 是后加的列（2026-10 起的「成长时间线配图」）。
+-- 已经在跑的库不会因为改这个文件而自动多出这一列 —— 后端在第一次读写事件时
+-- 会惰性执行 ALTER TABLE events ADD COLUMN images（见 ensureEventImages）。
+-- 新建库（含 D1 控制台跑本文件）直接就有，无需额外操作。
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   student_id TEXT NOT NULL,
   event_date TEXT NOT NULL,
   event_type TEXT NOT NULL,           -- 奖励/活动/提醒
   content TEXT NOT NULL,
+  images TEXT DEFAULT '[]',           -- 图片附件：base64 dataURL 的 JSON 数组，最多 3 张
   created_at TEXT DEFAULT (datetime('now')),
   FOREIGN KEY (student_id) REFERENCES users(id)
 );

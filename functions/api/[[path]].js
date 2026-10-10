@@ -275,9 +275,11 @@ async function dbGetStudent(env, id) {
     作业质量: behaviorRow.homework_quality
   } : {}
 
-  const { results: events } = await env.DB.prepare(
-    `SELECT event_date as date, event_type as type, content FROM events WHERE student_id = ? ORDER BY event_date`
-  ).bind(id).all()
+  // 成长事件（含图片附件）。
+  // id 必须带出去：前端删除要靠它定位。只按 (日期,类型,内容) 删的话，
+  // 同一天同类型同内容的两条「双胞胎事件」会被一次删掉两条。
+  await ensureEventImages(env)
+  const events = await readEvents(env, id)
 
   const aiReportRow = await env.DB.prepare(
     `SELECT report_json FROM ai_reports WHERE student_id = ? ORDER BY generated_at DESC LIMIT 1`
@@ -1121,7 +1123,14 @@ function aiProfileSummary(student) {
     作业情况: student.homework,
     作业明细: (student.homeworkDetail || []).slice(0, 10),
     课堂行为: student.behavior,
-    重要事件: (student.events || []).slice(0, 20)
+    // 事件里可能挂着图片附件（base64 dataURL，单张上限 1MB）。原样 JSON.stringify
+    // 会把提示词顶到几十 MB —— 和 scores._images 是同一类事故：附件只报张数，不报内容。
+    重要事件: (student.events || []).slice(0, 20).map(e => {
+      const row = { 日期: e.date, 类型: e.type, 内容: e.content }
+      const n = Array.isArray(e.images) ? e.images.length : 0
+      if (n) row.附件张数 = n
+      return row
+    })
   }
 }
 
@@ -1413,24 +1422,132 @@ async function handleDeleteScore(request, env, teacher, studentId, scoreId) {
   return jsonResp({ success: true, removed: loaded.row })
 }
 
-async function handleAddEvent(request, env, studentId) {
-  const { event_date, event_type, content } = await request.json()
+// ===== 成长事件：增 / 删（教师/管理员） =====
+
+// 一条成长事件最多挂几张图。与成绩附件的上限（src/utils/imageCompress.js 的 MAX_IMAGES）
+// 刻意保持一致：两处规则不同，教师会先疑惑「成绩能放 3 张、记录为什么只能放 2 张」，
+// 而且单行体积更容易顶到 D1 的行大小上限。
+const MAX_EVENT_IMAGES = 3
+
+// events.images 是后加的列 —— 线上库是项目早期在 D1 控制台手工建的，没有这一列。
+// 这里做一次性惰性迁移（与 ensureHomeworkTables 同一套思路），部署者不必手工跑 SQL。
+// 列已存在时 SQLite 抛 duplicate column name，那正是常态，直接吞掉。
+let eventImagesEnsured = false
+async function ensureEventImages(env) {
+  if (eventImagesEnsured) return
+  try {
+    await env.DB.prepare(`ALTER TABLE events ADD COLUMN images TEXT DEFAULT '[]'`).run()
+  } catch { /* 列已存在 */ }
+  eventImagesEnsured = true
+}
+
+/** events 行 → 接口形状。坏附件数据退化成空数组，不让一条事件拖垮整份档案 */
+function eventRow(r) {
+  let images = []
+  try {
+    const parsed = JSON.parse(r.images || '[]')
+    if (Array.isArray(parsed)) {
+      images = parsed.filter(x => typeof x === 'string' && x).slice(0, MAX_EVENT_IMAGES)
+    }
+  } catch { images = [] }
+  return { id: r.id, date: r.date, type: r.type, content: r.content, images }
+}
+
+// 读事件。两个调用点（整份档案、事件子资源）共用同一实现。
+// 对「images 列还不存在」做降级：迁移没跑成功时，宁可时间线暂时少显示图片，
+// 也不能让整份档案 500。
+async function readEvents(env, studentId) {
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT id, event_date as date, event_type as type, content, images
+       FROM events WHERE student_id = ? ORDER BY event_date, id`
+    ).bind(studentId).all()
+    return (results || []).map(eventRow)
+  } catch {
+    const { results } = await env.DB.prepare(
+      `SELECT id, event_date as date, event_type as type, content
+       FROM events WHERE student_id = ? ORDER BY event_date, id`
+    ).bind(studentId).all()
+    return (results || []).map(eventRow)
+  }
+}
+
+/** 校验请求体里的附件：必须是数组、最多 3 张、每张都是非空字符串。未提供时返回 null */
+function normalizeEventImages(raw) {
+  if (raw === undefined) return { images: null }
+  if (!Array.isArray(raw)) return { error: '附件格式不正确' }
+  if (raw.length > MAX_EVENT_IMAGES) return { error: `附件最多 ${MAX_EVENT_IMAGES} 张` }
+  if (raw.some(x => typeof x !== 'string' || !x)) return { error: '附件内容不正确' }
+  return { images: raw }
+}
+
+// 事件是写操作：教师只能动本班学生的。
+// 旧实现只 requireTeacher、没有班级范围校验 —— 任何教师改一下 URL 里的学号，
+// 就能往别班学生的时间线上写东西、或删掉别人的记录。
+async function scopeCheckEventTarget(env, teacher, studentId) {
+  const target = await env.DB.prepare(
+    `SELECT id, class_name FROM users WHERE id = ? AND role = 'student'`
+  ).bind(studentId).first()
+  if (!target) return jsonResp({ error: '学生不存在' }, 404)
+  if (teacherOutOfScope(teacher, target.class_name)) {
+    return jsonResp({ error: '无权操作其他班级学生的记录' }, 403)
+  }
+  return null
+}
+
+async function handleAddEvent(request, env, teacher, studentId) {
+  const denied = await scopeCheckEventTarget(env, teacher, studentId)
+  if (denied) return denied
+
+  const body = await request.json().catch(() => ({}))
+  const { event_date, event_type, content } = body
   if (!event_date || !event_type || !content) return jsonResp({ error: '缺少参数' }, 400)
-  await env.DB.prepare(
-    `INSERT INTO events (student_id, event_date, event_type, content) VALUES (?, ?, ?, ?)`
-  ).bind(studentId, event_date, event_type, content).run()
+
+  const parsed = normalizeEventImages(body.images)
+  if (parsed.error) return jsonResp({ error: parsed.error }, 400)
+  const imagesJson = JSON.stringify(parsed.images || [])
+
+  await ensureEventImages(env)
+  try {
+    await env.DB.prepare(
+      `INSERT INTO events (student_id, event_date, event_type, content, images) VALUES (?, ?, ?, ?, ?)`
+    ).bind(studentId, event_date, event_type, content, imagesJson).run()
+  } catch (e) {
+    // 迁移没生效（images 列还不存在）时退化成「不带图也能记一条」，
+    // 而不是让教师看到一句「添加失败」却完全不知道原因。
+    await env.DB.prepare(
+      `INSERT INTO events (student_id, event_date, event_type, content) VALUES (?, ?, ?, ?)`
+    ).bind(studentId, event_date, event_type, content).run()
+  }
   return jsonResp({ success: true })
 }
 
-async function handleDeleteEvent(request, env, studentId) {
+async function handleDeleteEvent(request, env, teacher, studentId) {
+  const denied = await scopeCheckEventTarget(env, teacher, studentId)
+  if (denied) return denied
+
   const url = new URL(request.url)
+
+  // 优先按行主键删。回落到 (日期,类型,内容) 只是为了让老版本前端不至于报错 ——
+  // 那条路会把「同一天、同类型、同内容」的两条记录一起删掉，所以只要前端给了 id 就不走它。
+  const rawId = url.searchParams.get('id')
+  const idNum = Number(rawId)
+  if (rawId && Number.isInteger(idNum) && idNum > 0) {
+    const r = await env.DB.prepare(
+      `DELETE FROM events WHERE id = ? AND student_id = ?`
+    ).bind(idNum, studentId).run()
+    if (Number(r?.meta?.changes ?? 0) === 0) return jsonResp({ error: '未找到该条记录' }, 404)
+    return jsonResp({ success: true, removed: idNum })
+  }
+
   const event_date = url.searchParams.get('event_date')
   const event_type = url.searchParams.get('event_type')
   const content = url.searchParams.get('content')
   if (!event_date || !event_type || !content) return jsonResp({ error: '缺少参数' }, 400)
-  await env.DB.prepare(
+  const r = await env.DB.prepare(
     `DELETE FROM events WHERE student_id = ? AND event_date = ? AND event_type = ? AND content = ?`
   ).bind(studentId, event_date, event_type, content).run()
+  if (Number(r?.meta?.changes ?? 0) === 0) return jsonResp({ error: '未找到该条记录' }, 404)
   return jsonResp({ success: true })
 }
 
@@ -2382,10 +2499,8 @@ export async function onRequest(context) {
       return jsonResp(results)
     }
     if (parts[2] === 'events') {
-      const { results } = await env.DB.prepare(
-        `SELECT event_date as date, event_type as type, content FROM events WHERE student_id = ? ORDER BY event_date`
-      ).bind(studentId).all()
-      return jsonResp(results)
+      await ensureEventImages(env)
+      return jsonResp(await readEvents(env, studentId))
     }
     const student = await dbGetStudent(env, studentId)
     if (!student) return jsonResp({ error: '未找到该学生' }, 404)
@@ -2413,12 +2528,12 @@ export async function onRequest(context) {
   if (path.match(/^\/student\/[^/]+\/event$/) && method === 'POST') {
     const { user: teacher, response: r } = await requireTeacher(request, env)
     if (r) return r
-    return handleAddEvent(request, env, path.split('/')[2])
+    return handleAddEvent(request, env, teacher, path.split('/')[2])
   }
   if (path.match(/^\/student\/[^/]+\/event$/) && method === 'DELETE') {
     const { user: teacher, response: r } = await requireTeacher(request, env)
     if (r) return r
-    return handleDeleteEvent(request, env, path.split('/')[2])
+    return handleDeleteEvent(request, env, teacher, path.split('/')[2])
   }
 
   // 课堂行为评分编辑（教师/管理员）

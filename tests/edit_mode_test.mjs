@@ -129,6 +129,7 @@ const GATES = [
   ['src/views/StudentProfile.vue', 'v-if="canEdit" class="card no-print"', '添加成绩卡片'],
   ['src/views/StudentProfile.vue', 'v-if="canEdit" class="event-form"', '时间线添加表单'],
   ['src/views/StudentProfile.vue', 'v-if="canEdit" class="del-btn" @click="doDeleteEvent(i)"', '时间线删除按钮'],
+  ['src/views/StudentProfile.vue', 'v-if="canEdit && eventForm.images.length" class="img-preview-list"', '时间线待提交配图'],
   ['src/views/StudentProfile.vue', 'v-if="behaviorEditing && canEdit"', '行为评分弹窗'],
   ['src/views/StudentProfile.vue', 'v-if="homeworkEditing && canEdit"', '作业提交情况弹窗'],
 

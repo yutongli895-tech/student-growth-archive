@@ -266,15 +266,24 @@
       <div v-if="canEdit" class="event-form">
         <input v-model="eventForm.event_date" type="date" class="input" />
         <select v-model="eventForm.event_type" class="select">
-          <option>奖励</option>
-          <option>惩罚</option>
-          <option>比赛</option>
-          <option>活动</option>
-          <option>提醒</option>
-          <option>其他</option>
+          <option v-for="t in EVENT_TYPES" :key="t" :value="t">{{ t }}</option>
         </select>
         <input v-model="eventForm.content" type="text" class="input" placeholder="记录内容" style="flex:1; min-width:160px" />
+        <label class="img-label" :title="`可为这条记录配图，最多 ${MAX_IMAGES} 张（自动压缩）`">
+          <input type="file" accept="image/*" capture="environment" multiple style="display:none" @change="onEventImgChange" />
+          <span class="btn outline btn-sm" :class="{ 'img-full': eventForm.images.length >= MAX_IMAGES }">
+            📷 配图 {{ eventForm.images.length }}/{{ MAX_IMAGES }}
+          </span>
+        </label>
         <button class="btn-primary btn-sm" :disabled="eventLoading" @click="doAddEvent">添加</button>
+      </div>
+      <!-- 待提交的配图：还没落库，所以放在表单正下方，和已保存的记录区分开 -->
+      <div v-if="canEdit && eventForm.images.length" class="img-preview-list" style="margin-bottom:12px">
+        <div v-for="(img, i) in eventForm.images" :key="i" class="img-thumb">
+          <img :src="img.src" alt="待添加的配图" />
+          <button class="img-remove" title="移除这张" @click="removeEventImg(i)">✕</button>
+        </div>
+        <span style="font-size:12px;color:var(--muted)">将随这条记录一起保存</span>
       </div>
       <div v-if="eventMsg" class="msg" :class="eventMsgType">{{ eventMsg }}</div>
       <div class="timeline">
@@ -283,6 +292,16 @@
             <button v-if="canEdit" class="del-btn" @click="doDeleteEvent(i)" title="删除">×</button>
           </div>
           <div>{{ e.content }}</div>
+          <div v-if="e.images && e.images.length" class="event-imgs">
+            <img
+              v-for="(img, k) in e.images"
+              :key="k"
+              :src="img"
+              class="event-img"
+              :alt="`${e.date} 的配图 ${k + 1}`"
+              @click="previewImg(img)"
+            />
+          </div>
         </div>
       </div>
     </div>
@@ -296,6 +315,7 @@ import { getStudent, generateAIReport, getSubjects, addScore, addEvent, deleteEv
 import { getRole } from '../api/auth.js'
 import { useEditMode, setEditMode } from '../utils/editMode.js'
 import { collectImages, MAX_IMAGES } from '../utils/imageCompress.js'
+import { EVENT_TYPES, emptyEventForm, eventDeleteParams, eventImagePayload } from '../utils/eventForm.js'
 import ScoreTrendChart from '../components/ScoreTrendChart.vue'
 import BehaviorRadar from '../components/BehaviorRadar.vue'
 import ScoreRecordList from '../components/ScoreRecordList.vue'
@@ -341,7 +361,7 @@ const scoreMsgType = ref('ok')
 const showExamModal = ref(false)
 const examDetail = ref({ exam: '', scores: {}, images: {}, imagesCount: 0 })
 const previewSrc = ref('')
-const eventForm = ref({ event_date: '', event_type: '奖励', content: '' })
+const eventForm = ref(emptyEventForm())
 const eventMsg = ref('')
 const eventMsgType = ref('ok')
 const eventLoading = ref(false)
@@ -389,6 +409,22 @@ function removeImg(i) {
 
 function previewImg(src) {
   previewSrc.value = src
+}
+
+// ========== 成长时间线的配图 ==========
+// 复用成绩附件那一套压缩与上限规则（utils/imageCompress.js）：
+// 时间线配图和成绩附件唯一的区别只是「挂在哪个表单上」，规则不该有第二份。
+async function onEventImgChange(e) {
+  const room = MAX_IMAGES - eventForm.value.images.length
+  const { added, errors } = await collectImages(e.target.files, room)
+  if (added.length) eventForm.value.images.push(...added)
+  if (errors.length) { eventMsg.value = errors.join('；'); eventMsgType.value = 'err' }
+  else if (added.length) { eventMsg.value = `已附加 ${added.length} 张，点「添加」后保存`; eventMsgType.value = 'ok' }
+  e.target.value = ''
+}
+
+function removeEventImg(i) {
+  eventForm.value.images.splice(i, 1)
 }
 
 // ========== 成绩详情弹窗 ==========
@@ -522,11 +558,15 @@ async function doAddEvent() {
   eventLoading.value = true; eventMsg.value = ''
   try {
     const r = await addEvent(student.value.id, {
-      event_date: f.event_date, event_type: f.event_type, content: f.content.trim()
+      event_date: f.event_date, event_type: f.event_type, content: f.content.trim(),
+      // 只把 dataURL 交出去：表单里的 { src, name } 是给界面显示用的，
+      // 整包发过去会让后端存进一堆用不上的字段名。
+      images: eventImagePayload(f.images)
     })
     if (r.success) {
-      eventMsg.value = '已添加'; eventMsgType.value = 'ok'
-      f.event_date = ''; f.event_type = '奖励'; f.content = ''
+      eventMsg.value = f.images.length ? `已添加（含 ${f.images.length} 张配图）` : '已添加'
+      eventMsgType.value = 'ok'
+      eventForm.value = emptyEventForm()
       student.value = await getStudent(student.value.id)
     } else { eventMsg.value = r.error || '添加失败'; eventMsgType.value = 'err' }
   } catch (e) { eventMsg.value = e.message; eventMsgType.value = 'err' }
@@ -534,14 +574,20 @@ async function doAddEvent() {
 }
 
 async function doDeleteEvent(i) {
-  if (!confirm('确认删除这条记录？')) return
   const e = student.value.events[i]
-  const r = await deleteEvent(student.value.id, {
-    event_date: e.date, event_type: e.type, content: e.content
-  })
-  if (r.success) {
-    student.value = await getStudent(student.value.id)
-  }
+  const withImg = e?.images?.length ? `（含 ${e.images.length} 张配图）` : ''
+  if (!confirm(`确认删除这条记录${withImg}？`)) return
+  // 删除失败的原文要显示出来：只 return 的话，教师点了 × 什么都不发生，
+  // 会以为是自己没点中，反复点。
+  try {
+    const r = await deleteEvent(student.value.id, eventDeleteParams(e))
+    if (r && r.success) {
+      eventMsg.value = '已删除'; eventMsgType.value = 'ok'
+      student.value = await getStudent(student.value.id)
+    } else {
+      eventMsg.value = r?.error || '删除失败'; eventMsgType.value = 'err'
+    }
+  } catch (err) { eventMsg.value = err.message; eventMsgType.value = 'err' }
 }
 
 // ========== 行为评分编辑 ==========
@@ -749,6 +795,16 @@ async function doSaveHomework() {
   width: 18px; height: 18px; border-radius: 50%; background: #ef4444; color: #fff;
   border: none; cursor: pointer; font-size: 10px; line-height: 18px; text-align: center;
   padding: 0;
+}
+/* 已达上限时把按钮压暗：「为什么点不动了」要一眼看得出来 */
+.img-label .btn.img-full { opacity: .55; cursor: not-allowed; }
+
+/* 时间线上的配图。刻意与成绩附件的 .exam-img 同一套尺寸与圆角 ——
+   两个能挂图片的地方，看起来应当是同一个东西。 */
+.event-imgs { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.event-img {
+  width: 80px; height: 80px; object-fit: cover; border-radius: 6px;
+  cursor: zoom-in; border: 1px solid #e0e4ea; display: block;
 }
 
 /* 弹窗 */

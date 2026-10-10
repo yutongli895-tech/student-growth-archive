@@ -226,6 +226,8 @@ export async function importScores(rows) {
 }
 
 // payload: { event_date, event_type, content }
+// payload: { event_date, event_type, content, images? }
+// images 是 base64 dataURL 的数组（最多 3 张，前端已压缩），不传或传 [] 表示没有配图
 export async function addEvent(studentId, payload) {
   if (USE_WORKER) {
     return fetchJSON(`${API}/student/${studentId}/event`, {
@@ -237,7 +239,9 @@ export async function addEvent(studentId, payload) {
   return { success: true }
 }
 
-// payload: { event_date, event_type, content }
+// payload: { id } —— 按事件行主键删。
+// 旧的 { event_date, event_type, content } 三元组仍被后端接受，但会把同一天、
+// 同类型、同内容的两条记录一起删掉，只作老数据回落（见 utils/eventForm.js）。
 export async function deleteEvent(studentId, payload) {
   if (USE_WORKER) {
     const params = new URLSearchParams(payload).toString()
