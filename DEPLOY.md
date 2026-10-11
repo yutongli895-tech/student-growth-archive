@@ -73,7 +73,43 @@ git push -u origin main
 - **建表**：`homework_assignments`、`homework_records` 两张表由后端
   `ensureHomeworkTables()` 在**首次调用作业接口时自动创建**，部署时无需手工执行 SQL。
   `schema/homework-detail.sql` 是同结构的归档版本，供手工/CI 初始化使用。
+- **加列**：`events.images`（成长时间线配图）由 `ensureEventImages()` 在**首次读写成长事件时
+  自动 `ALTER TABLE`**，老库同样无需手工执行 SQL。
 - **好消息**：新表是纯增量，**不影响已有数据**；自动建表失败时接口会降级（档案仍可正常读取）。
+
+### 后加的列怎么迁移：惰性 ALTER（以 `events.images` 为例）
+
+线上库是项目早期**在控制台手工建的**（见下一节），改 `schema/baseline.sql` 只会影响
+**新建的库**，已经在跑的库不会自动多出一列。所以「后加的列」一律走惰性迁移：
+
+```js
+// functions/api/[[path]].js
+let eventImagesEnsured = false
+async function ensureEventImages(env) {
+  if (eventImagesEnsured) return
+  try {
+    await env.DB.prepare(`ALTER TABLE events ADD COLUMN images TEXT DEFAULT '[]'`).run()
+  } catch { /* 列已存在时 SQLite 抛 duplicate column name，那正是常态 */ }
+  eventImagesEnsured = true
+}
+```
+
+三条配套规矩（`ensureHomeworkTables()` 打下的同一套思路，新增列请照抄）：
+
+1. **在写接口和读接口里都要调用**，不能只放在启动流程里 —— 没有启动钩子可言，
+   Worker 是冷启动的。所以 `ensureEventImages()` 在 `handleAddEvent`、`dbGetStudent`、
+   事件子资源三处都调。
+2. **读侧必须有降级路径**。迁移没跑成功时，`readEvents()` 会退化成不带 `images` 列的
+   `SELECT` —— 宁可时间线暂时少显示图片，也**不能让整份档案 500**。写侧同理，
+   带 `images` 的 `INSERT` 失败就退化成不带 `images` 的 `INSERT`。
+3. **失败要静默吞掉，但要确认是真的「列已存在」**。这里的 `catch {}` 是刻意的：
+   列已存在时 SQLite 必抛 `duplicate column name`，把它当错误上报会让每次请求都报错。
+
+> 想确认线上到底有没有这一列，别凭印象，直接查（`PRAGMA table_info` 对**普通列**是可靠的，
+> 只有生成列不列出）：
+> ```bash
+> npx wrangler d1 execute student-growth-archive --remote --command "PRAGMA table_info(events)"
+> ```
 
 ### ⚠️ 改数据库前必读：表结构以线上为准
 
@@ -393,6 +429,7 @@ npx wrangler d1 execute student-growth-archive --remote --file=schema/baseline.s
 
 ⚠️ `--remote` 必须加，否则 SQL 只写进本地模拟库，线上会一直报"表不存在"。
 `baseline.sql` 含 11 张表 + 4 个索引，建完不需要再做别的。
+**新建的库连 `events.images` 都已经带上了**，不用再跑惰性迁移 —— 那一套只对老库生效。
 
 > 不想装 Node / wrangler 也可以：**建表和管理员两步都能直接在 Cloudflare 控制台的
 > D1 查询框里完成**，做法见 13.7。控制台默认操作的就是远程库，反而没有 `--remote` 这个坑。
